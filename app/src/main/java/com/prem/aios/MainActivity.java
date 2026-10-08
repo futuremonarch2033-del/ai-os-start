@@ -35,7 +35,7 @@ public class MainActivity extends Activity {
     private static final String ACT_RECORD = "record";
     private static final String ACT_LISTEN = "listen";
     private static final String GEMINI_URL =
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
 
     private TextView status;
     private TextView transcript;
