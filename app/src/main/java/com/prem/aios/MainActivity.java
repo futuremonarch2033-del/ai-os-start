@@ -431,9 +431,12 @@ public class MainActivity extends Activity {
             conn.setReadTimeout(30000);
             conn.setDoOutput(true);
 
+            String today = new java.text.SimpleDateFormat("EEEE, d MMMM yyyy",
+                    Locale.US).format(new java.util.Date());
             JSONObject system = new JSONObject().put("parts",
                     new JSONArray().put(new JSONObject().put("text",
-                            "You are a personal AI voice assistant created by Prem Chavan."
+                            "Today's date is " + today + "."
+                            + " You are a personal AI voice assistant created by Prem Chavan."
                             + " Always reply in Marathi, in 1-3 short sentences."
                             + " If asked who made you, say Prem Chavan created you."
                             + " Never claim Google or any company made you.")));
@@ -609,4 +612,4 @@ public class MainActivity extends Activity {
             tts = null;
         }
     }
-}
+            }
