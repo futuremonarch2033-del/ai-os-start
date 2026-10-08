@@ -10,6 +10,7 @@ import android.os.Bundle;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
+import android.speech.tts.TextToSpeech;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -27,6 +28,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Locale;
 
 public class MainActivity extends Activity {
 
@@ -52,6 +54,13 @@ public class MainActivity extends Activity {
     private SpeechRecognizer recognizer;
     private boolean listening = false;
     private String pendingAction = ACT_NONE;
+
+    private TextToSpeech tts;
+    private boolean ttsInitDone = false;
+    private boolean ttsReady = false;
+    private boolean pendingSpeak = false;
+    private String lastReply = "";
+    private Button replayBtn;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -83,6 +92,9 @@ public class MainActivity extends Activity {
         playBtn.setText("PLAY");
         playBtn.setEnabled(false);
 
+        replayBtn = new Button(this);
+        replayBtn.setText("REPLAY VOICE");
+
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setGravity(Gravity.CENTER);
@@ -94,6 +106,7 @@ public class MainActivity extends Activity {
         layout.addView(listenBtn, lp);
         layout.addView(transcript, lp);
         layout.addView(reply, lp);
+        layout.addView(replayBtn, lp);
         layout.addView(recordBtn, lp);
         layout.addView(playBtn, lp);
         setContentView(layout);
@@ -127,6 +140,37 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 playRecording();
+            }
+        });
+
+        replayBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (lastReply.isEmpty()) {
+                    status.setText("Nothing to replay yet - LISTEN first");
+                } else {
+                    speakReply();
+                }
+            }
+        });
+
+        // ---- Step 4: text-to-speech setup ----
+        tts = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
+            @Override
+            public void onInit(int initStatus) {
+                ttsInitDone = true;
+                if (initStatus == TextToSpeech.SUCCESS) {
+                    int r = tts.setLanguage(new Locale("mr", "IN"));
+                    ttsReady = (r == TextToSpeech.LANG_AVAILABLE
+                            || r == TextToSpeech.LANG_COUNTRY_AVAILABLE
+                            || r == TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE);
+                } else {
+                    ttsReady = false;
+                }
+                if (pendingSpeak) {
+                    pendingSpeak = false;
+                    speakReply();
+                }
             }
         });
     }
@@ -303,6 +347,12 @@ public class MainActivity extends Activity {
                         } else {
                             status.setText("Done. LISTEN again?");
                             reply.setText(result);
+                            lastReply = result;
+                            if (ttsInitDone) {
+                                speakReply();
+                            } else {
+                                pendingSpeak = true;
+                            }
                         }
                     }
                 });
@@ -324,8 +374,10 @@ public class MainActivity extends Activity {
 
             JSONObject system = new JSONObject().put("parts",
                     new JSONArray().put(new JSONObject().put("text",
-                            "You are a helpful voice assistant."
-                            + " Always reply in Marathi, in 1-3 short sentences.")));
+                            "You are a personal AI voice assistant created by Prem Chavan."
+                            + " Always reply in Marathi, in 1-3 short sentences."
+                            + " If asked who made you, say Prem Chavan created you."
+                            + " Never claim Google or any company made you.")));
             JSONObject content = new JSONObject().put("parts",
                     new JSONArray().put(new JSONObject().put("text", userText)));
             JSONObject body = new JSONObject()
@@ -385,6 +437,20 @@ public class MainActivity extends Activity {
         }
         s = s.replace('\n', ' ').trim();
         return s.length() > 120 ? s.substring(0, 120) : s;
+    }
+
+    // ---- Step 4: speak the reply aloud (Marathi voice) ----
+
+    private void speakReply() {
+        if (tts == null || !ttsReady) {
+            status.setText("Marathi voice not installed - reply is text-only below."
+                    + " Install: Settings > General management > Text-to-speech"
+                    + " > Google TTS voice data > Marathi");
+            return;
+        }
+        tts.stop();
+        tts.speak(lastReply, TextToSpeech.QUEUE_FLUSH, null, "reply-utterance");
+        status.setText("Speaking reply... (REPLAY VOICE to hear again)");
     }
 
     // ---- Step 1: mic record + playback ----
@@ -460,6 +526,11 @@ public class MainActivity extends Activity {
         if (player != null) {
             player.release();
             player = null;
+        }
+        if (tts != null) {
+            tts.stop();
+            tts.shutdown();
+            tts = null;
         }
     }
 }
