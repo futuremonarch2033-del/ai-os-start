@@ -4,6 +4,9 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraManager;
 import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.os.Bundle;
@@ -34,6 +37,7 @@ import java.util.Locale;
 public class MainActivity extends Activity {
 
     private static final int REQ_MIC = 1001;
+    private static final int REQ_CAMERA = 1002;
     private static final String ACT_NONE = "";
     private static final String ACT_RECORD = "record";
     private static final String ACT_LISTEN = "listen";
@@ -64,6 +68,12 @@ public class MainActivity extends Activity {
     private Button replayBtn;
     private boolean loopActive = false;
     private int consecutiveListenErrors = 0;
+    private CameraManager cameraManager;
+    private String torchCameraId;
+    private boolean torchAvailable = false;
+    private boolean torchOn = false;
+    private int pendingTorch = 0;
+    private TextView torchStatus;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -74,6 +84,11 @@ public class MainActivity extends Activity {
         status.setTextSize(20f);
         status.setGravity(Gravity.CENTER);
         status.setText("LISTEN = speak Marathi, AI replies below");
+
+        torchStatus = new TextView(this);
+        torchStatus.setTextSize(18f);
+        torchStatus.setGravity(Gravity.CENTER);
+        torchStatus.setText("Torch: OFF");
 
         transcript = new TextView(this);
         transcript.setTextSize(22f);
@@ -106,6 +121,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.setMargins(24, 14, 24, 14);
         layout.addView(status, lp);
+        layout.addView(torchStatus, lp);
         layout.addView(listenBtn, lp);
         layout.addView(transcript, lp);
         layout.addView(reply, lp);
@@ -113,6 +129,52 @@ public class MainActivity extends Activity {
         layout.addView(recordBtn, lp);
         layout.addView(playBtn, lp);
         setContentView(layout);
+
+        // ---- Step 7: flashlight (torch) setup ----
+        cameraManager = (CameraManager) getSystemService(CAMERA_SERVICE);
+        try {
+            for (String id : cameraManager.getCameraIdList()) {
+                CameraCharacteristics ch = cameraManager.getCameraCharacteristics(id);
+                Boolean hasFlash = ch.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
+                Integer facing = ch.get(CameraCharacteristics.LENS_FACING);
+                if (Boolean.TRUE.equals(hasFlash)) {
+                    torchCameraId = id;
+                    if (facing != null
+                            && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                        break;
+                    }
+                }
+            }
+        } catch (CameraAccessException e) {
+            torchCameraId = null;
+        }
+        torchAvailable = (torchCameraId != null);
+        if (torchAvailable) {
+            cameraManager.registerTorchCallback(new CameraManager.TorchCallback() {
+                @Override
+                public void onTorchModeChanged(String cameraId, boolean enabled) {
+                    if (cameraId.equals(torchCameraId)) {
+                        torchOn = enabled;
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                torchStatus.setText(torchOn ? "Torch: ON" : "Torch: OFF");
+                            }
+                        });
+                    }
+                }
+
+                @Override
+                public void onTorchModeUnavailable(String cameraId) {
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            torchStatus.setText("Torch: unavailable (camera busy)");
+                        }
+                    });
+                }
+            }, null);
+        }
 
         listenBtn.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -234,6 +296,19 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions,
                                            int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_CAMERA) {
+            if (grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                if (pendingTorch != 0) {
+                    applyTorch(pendingTorch == 1);
+                }
+            } else {
+                status.setText("Camera permission denied - cannot control torch");
+                reply.setText("(torch not changed)");
+            }
+            pendingTorch = 0;
+            return;
+        }
         if (requestCode == REQ_MIC) {
             if (grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
@@ -316,7 +391,9 @@ public class MainActivity extends Activity {
                     status.setText("Error: empty result");
                 } else {
                     transcript.setText(text);
-                    askGemini(text);
+                    if (!handleLocalCommand(text)) {
+                        askGemini(text);
+                    }
                 }
             }
 
@@ -532,6 +609,66 @@ public class MainActivity extends Activity {
         status.setText("Speaking reply... (REPLAY VOICE to hear again)");
     }
 
+    // ---- Step 7: on-device command layer - flashlight ----
+
+    private boolean handleLocalCommand(String text) {
+        String t = text.toLowerCase(Locale.US);
+        boolean mentionsTorch = t.contains("टॉर्च") || t.contains("torch")
+                || t.contains("flashlight") || t.contains("फ्लॅश") || t.contains("लाइट");
+        if (!mentionsTorch) {
+            return false;
+        }
+        boolean wantsOff = t.contains("बंद") || t.contains("ऑफ")
+                || t.matches(".*\\boff\\b.*");
+        boolean wantsOn = t.contains("चालू") || t.contains("सुरू")
+                || t.contains("लाव") || t.contains("ऑन")
+                || t.matches(".*\\bon\\b.*");
+        if (wantsOff) {
+            handleTorchCommand(false);
+            return true;
+        }
+        if (wantsOn) {
+            handleTorchCommand(true);
+            return true;
+        }
+        return false;
+    }
+
+    private void handleTorchCommand(boolean turnOn) {
+        if (!torchAvailable) {
+            reply.setText("This phone has no flashlight hardware");
+            status.setText("Torch not available on this device");
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            pendingTorch = turnOn ? 1 : -1;
+            status.setText("Camera permission needed to control the torch");
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA);
+            return;
+        }
+        applyTorch(turnOn);
+    }
+
+    private void applyTorch(boolean turnOn) {
+        try {
+            cameraManager.setTorchMode(torchCameraId, turnOn);
+            torchOn = turnOn;
+            torchStatus.setText(turnOn ? "Torch: ON" : "Torch: OFF");
+            String confirm = turnOn ? "टॉर्च चालू केला" : "टॉर्च बंद केला";
+            reply.setText(confirm);
+            lastReply = confirm;
+            if (ttsInitDone) {
+                speakReply();
+            } else {
+                pendingSpeak = true;
+            }
+        } catch (CameraAccessException | RuntimeException e) {
+            status.setText("Torch failed: camera busy - close camera apps and retry");
+            reply.setText("(torch not changed)");
+        }
+    }
+
     // ---- Step 1: mic record + playback ----
 
     private void startRecording() {
@@ -612,4 +749,4 @@ public class MainActivity extends Activity {
             tts = null;
         }
     }
-            }
+}
