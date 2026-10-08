@@ -171,7 +171,7 @@ public class MainActivity extends Activity {
             }
 
             @Override
-            public void onRmsdBChanged(float rmsdB) { }
+            public void onRmsChanged(float rmsdB) { }
 
             @Override
             public void onBufferReceived(byte[] buffer) { }
