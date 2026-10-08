@@ -11,6 +11,7 @@ import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -61,6 +62,8 @@ public class MainActivity extends Activity {
     private boolean pendingSpeak = false;
     private String lastReply = "";
     private Button replayBtn;
+    private boolean loopActive = false;
+    private int consecutiveListenErrors = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -114,12 +117,20 @@ public class MainActivity extends Activity {
         listenBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                if (listening) {
+                if (listening || loopActive) {
+                    loopActive = false;
                     if (recognizer != null) {
                         recognizer.stopListening();
                     }
-                    status.setText("Finishing...");
+                    if (tts != null) {
+                        tts.stop();
+                    }
+                    listening = false;
+                    listenBtn.setText("LISTEN");
+                    status.setText("Conversation stopped. LISTEN to start again");
                 } else {
+                    loopActive = true;
+                    consecutiveListenErrors = 0;
                     ensureMicPermission(ACT_LISTEN);
                 }
             }
@@ -128,6 +139,10 @@ public class MainActivity extends Activity {
         recordBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                loopActive = false;
+                if (listening && recognizer != null) {
+                    recognizer.stopListening();
+                }
                 if (recording) {
                     stopRecording();
                 } else {
@@ -171,6 +186,32 @@ public class MainActivity extends Activity {
                     pendingSpeak = false;
                     speakReply();
                 }
+            }
+        });
+
+        // ---- Step 5: continuous hands-free loop ----
+        tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+            @Override
+            public void onStart(String utteranceId) { }
+
+            @Override
+            public void onDone(String utteranceId) {
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        maybeContinueLoop();
+                    }
+                });
+            }
+
+            @Override
+            public void onError(String utteranceId) {
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        maybeContinueLoop();
+                    }
+                });
             }
         });
     }
@@ -228,6 +269,7 @@ public class MainActivity extends Activity {
 
             @Override
             public void onBeginningOfSpeech() {
+                consecutiveListenErrors = 0;
                 status.setText("Hearing you...");
             }
 
@@ -245,14 +287,30 @@ public class MainActivity extends Activity {
             @Override
             public void onError(int error) {
                 listening = false;
-                listenBtn.setText("LISTEN");
-                status.setText("Error: " + errorText(error));
+                if (loopActive) {
+                    consecutiveListenErrors++;
+                    if (consecutiveListenErrors >= 5) {
+                        loopActive = false;
+                        listenBtn.setText("LISTEN");
+                        status.setText("Stopped after repeated errors: " + errorText(error));
+                    } else {
+                        status.setText("Retrying... (" + errorText(error) + ")");
+                        listenBtn.setText("STOP LISTEN");
+                        maybeContinueLoop();
+                    }
+                } else {
+                    listenBtn.setText("LISTEN");
+                    status.setText("Error: " + errorText(error));
+                }
             }
 
             @Override
             public void onResults(Bundle results) {
                 listening = false;
-                listenBtn.setText("LISTEN");
+                consecutiveListenErrors = 0;
+                if (!loopActive) {
+                    listenBtn.setText("LISTEN");
+                }
                 String text = bestResult(results);
                 if (text == null || text.isEmpty()) {
                     status.setText("Error: empty result");
@@ -344,6 +402,7 @@ public class MainActivity extends Activity {
                         if (result.startsWith("Error:")) {
                             status.setText(result);
                             reply.setText("(no reply)");
+                            maybeContinueLoop();
                         } else {
                             status.setText("Done. LISTEN again?");
                             reply.setText(result);
@@ -439,6 +498,22 @@ public class MainActivity extends Activity {
         return s.length() > 120 ? s.substring(0, 120) : s;
     }
 
+    // ---- Step 5: restart listening so the conversation keeps going ----
+
+    private void maybeContinueLoop() {
+        if (!loopActive || listening) {
+            return;
+        }
+        listenBtn.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (loopActive && !listening) {
+                    startListening();
+                }
+            }
+        }, 400);
+    }
+
     // ---- Step 4: speak the reply aloud (Marathi voice) ----
 
     private void speakReply() {
@@ -446,6 +521,7 @@ public class MainActivity extends Activity {
             status.setText("Marathi voice not installed - reply is text-only below."
                     + " Install: Settings > General management > Text-to-speech"
                     + " > Google TTS voice data > Marathi");
+            maybeContinueLoop();
             return;
         }
         tts.stop();
