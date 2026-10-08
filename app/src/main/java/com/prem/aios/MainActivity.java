@@ -16,8 +16,16 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 
 public class MainActivity extends Activity {
@@ -26,9 +34,12 @@ public class MainActivity extends Activity {
     private static final String ACT_NONE = "";
     private static final String ACT_RECORD = "record";
     private static final String ACT_LISTEN = "listen";
+    private static final String GEMINI_URL =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
     private TextView status;
     private TextView transcript;
+    private TextView reply;
     private Button recordBtn;
     private Button playBtn;
     private Button listenBtn;
@@ -50,12 +61,17 @@ public class MainActivity extends Activity {
         status = new TextView(this);
         status.setTextSize(20f);
         status.setGravity(Gravity.CENTER);
-        status.setText("LISTEN = Marathi speech to text, RECORD = mic test");
+        status.setText("LISTEN = speak Marathi, AI replies below");
 
         transcript = new TextView(this);
-        transcript.setTextSize(24f);
+        transcript.setTextSize(22f);
         transcript.setGravity(Gravity.CENTER);
-        transcript.setText("(Marathi transcript will appear here)");
+        transcript.setText("(your Marathi transcript)");
+
+        reply = new TextView(this);
+        reply.setTextSize(22f);
+        reply.setGravity(Gravity.CENTER);
+        reply.setText("(AI reply in Marathi)");
 
         listenBtn = new Button(this);
         listenBtn.setText("LISTEN");
@@ -73,10 +89,11 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.setMargins(24, 16, 24, 16);
+        lp.setMargins(24, 14, 24, 14);
         layout.addView(status, lp);
         layout.addView(listenBtn, lp);
         layout.addView(transcript, lp);
+        layout.addView(reply, lp);
         layout.addView(recordBtn, lp);
         layout.addView(playBtn, lp);
         setContentView(layout);
@@ -196,8 +213,8 @@ public class MainActivity extends Activity {
                 if (text == null || text.isEmpty()) {
                     status.setText("Error: empty result");
                 } else {
-                    status.setText("Done. LISTEN again?");
                     transcript.setText(text);
+                    askGemini(text);
                 }
             }
 
@@ -261,6 +278,113 @@ public class MainActivity extends Activity {
             default:
                 return "unknown (" + error + ")";
         }
+    }
+
+    // ---- Step 3: send transcript to Gemini brain, show reply ----
+
+    private void askGemini(final String userText) {
+        final String apiKey = BuildConfig.GEMINI_API_KEY;
+        if (apiKey == null || apiKey.isEmpty()) {
+            status.setText("No API key in this build - add GitHub secret and rebuild");
+            return;
+        }
+        status.setText("Thinking...");
+        reply.setText("...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final String result = callGemini(apiKey, userText);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (result.startsWith("Error:")) {
+                            status.setText(result);
+                            reply.setText("(no reply)");
+                        } else {
+                            status.setText("Done. LISTEN again?");
+                            reply.setText(result);
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private String callGemini(String apiKey, String userText) {
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(GEMINI_URL);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            conn.setRequestProperty("x-goog-api-key", apiKey);
+            conn.setConnectTimeout(20000);
+            conn.setReadTimeout(30000);
+            conn.setDoOutput(true);
+
+            JSONObject system = new JSONObject().put("parts",
+                    new JSONArray().put(new JSONObject().put("text",
+                            "You are a helpful voice assistant."
+                            + " Always reply in Marathi, in 1-3 short sentences.")));
+            JSONObject content = new JSONObject().put("parts",
+                    new JSONArray().put(new JSONObject().put("text", userText)));
+            JSONObject body = new JSONObject()
+                    .put("system_instruction", system)
+                    .put("contents", new JSONArray().put(content));
+
+            OutputStream os = conn.getOutputStream();
+            os.write(body.toString().getBytes("UTF-8"));
+            os.close();
+
+            int code = conn.getResponseCode();
+            InputStream is = (code >= 200 && code < 300)
+                    ? conn.getInputStream() : conn.getErrorStream();
+            String resp = readAll(is);
+            if (code < 200 || code >= 300) {
+                return "Error: Gemini HTTP " + code + " - " + snippet(resp);
+            }
+            JSONObject root = new JSONObject(resp);
+            JSONArray candidates = root.optJSONArray("candidates");
+            if (candidates == null || candidates.length() == 0) {
+                return "Error: Gemini returned no candidates";
+            }
+            JSONArray parts = candidates.getJSONObject(0)
+                    .getJSONObject("content").getJSONArray("parts");
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < parts.length(); i++) {
+                sb.append(parts.getJSONObject(i).optString("text", ""));
+            }
+            String text = sb.toString().trim();
+            return text.isEmpty() ? "Error: empty reply from Gemini" : text;
+        } catch (Exception e) {
+            return "Error: " + e.getClass().getSimpleName() + " - " + e.getMessage();
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    private String readAll(InputStream is) throws IOException {
+        if (is == null) {
+            return "";
+        }
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[4096];
+        int n;
+        while ((n = is.read(buf)) != -1) {
+            bos.write(buf, 0, n);
+        }
+        is.close();
+        return bos.toString("UTF-8");
+    }
+
+    private String snippet(String s) {
+        if (s == null) {
+            return "";
+        }
+        s = s.replace('\n', ' ').trim();
+        return s.length() > 120 ? s.substring(0, 120) : s;
     }
 
     // ---- Step 1: mic record + playback ----
