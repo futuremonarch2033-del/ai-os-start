@@ -2,6 +2,8 @@ package com.prem.aios;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.hardware.camera2.CameraAccessException;
@@ -74,6 +76,11 @@ public class MainActivity extends Activity {
     private boolean torchOn = false;
     private int pendingTorch = 0;
     private TextView torchStatus;
+    private Memory memory;
+    private TextView memoryStatus;
+    private Button viewMemoryBtn;
+    private Button forgetBtn;
+    private boolean awaitingForgetConfirm = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -84,6 +91,16 @@ public class MainActivity extends Activity {
         status.setTextSize(20f);
         status.setGravity(Gravity.CENTER);
         status.setText("LISTEN = speak Marathi, AI replies below");
+
+        memory = new Memory(this);
+        memoryStatus = new TextView(this);
+        memoryStatus.setTextSize(18f);
+        memoryStatus.setGravity(Gravity.CENTER);
+        viewMemoryBtn = new Button(this);
+        viewMemoryBtn.setText("VIEW MEMORY");
+        forgetBtn = new Button(this);
+        forgetBtn.setText("FORGET EVERYTHING");
+        updateMemoryStatus();
 
         torchStatus = new TextView(this);
         torchStatus.setTextSize(18f);
@@ -122,12 +139,15 @@ public class MainActivity extends Activity {
         lp.setMargins(24, 14, 24, 14);
         layout.addView(status, lp);
         layout.addView(torchStatus, lp);
+        layout.addView(memoryStatus, lp);
         layout.addView(listenBtn, lp);
         layout.addView(transcript, lp);
         layout.addView(reply, lp);
         layout.addView(replayBtn, lp);
         layout.addView(recordBtn, lp);
         layout.addView(playBtn, lp);
+        layout.addView(viewMemoryBtn, lp);
+        layout.addView(forgetBtn, lp);
         setContentView(layout);
 
         // ---- Step 7: flashlight (torch) setup ----
@@ -175,6 +195,24 @@ public class MainActivity extends Activity {
                 }
             }, null);
         }
+
+        viewMemoryBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Memory: " + memory.count() + " facts")
+                        .setMessage(memory.asDisplay())
+                        .setPositiveButton("OK", null)
+                        .show();
+            }
+        });
+
+        forgetBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                confirmForgetDialog();
+            }
+        });
 
         listenBtn.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -391,7 +429,7 @@ public class MainActivity extends Activity {
                     status.setText("Error: empty result");
                 } else {
                     transcript.setText(text);
-                    if (!handleLocalCommand(text)) {
+                    if (!handleMemoryCommand(text) && !handleLocalCommand(text)) {
                         askGemini(text);
                     }
                 }
@@ -512,7 +550,7 @@ public class MainActivity extends Activity {
                     Locale.US).format(new java.util.Date());
             JSONObject system = new JSONObject().put("parts",
                     new JSONArray().put(new JSONObject().put("text",
-                            "Today's date is " + today + "."
+                            "Today's date is " + today + "." + memory.asPrompt()
                             + " You are a personal AI voice assistant created by Prem Chavan."
                             + " Always reply in Marathi, in 1-3 short sentences."
                             + " If asked who made you, say Prem Chavan created you."
@@ -607,6 +645,81 @@ public class MainActivity extends Activity {
         tts.stop();
         tts.speak(lastReply, TextToSpeech.QUEUE_FLUSH, null, "reply-utterance");
         status.setText("Speaking reply... (REPLAY VOICE to hear again)");
+    }
+
+    // ---- Memory: on-device command layer ----
+
+    private void updateMemoryStatus() {
+        memoryStatus.setText("Memory: " + memory.count() + " facts");
+    }
+
+    private void showLocalReply(String msg) {
+        reply.setText(msg);
+        lastReply = msg;
+        updateMemoryStatus();
+        if (ttsInitDone) {
+            speakReply();
+        } else {
+            pendingSpeak = true;
+        }
+    }
+
+    private void confirmForgetDialog() {
+        new AlertDialog.Builder(this)
+                .setTitle("Forget everything?")
+                .setMessage("This deletes all " + memory.count()
+                        + " stored facts permanently.")
+                .setPositiveButton("YES, DELETE", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        memory.clear();
+                        updateMemoryStatus();
+                        status.setText("Memory erased");
+                    }
+                })
+                .setNegativeButton("CANCEL", null)
+                .show();
+    }
+
+    private boolean handleMemoryCommand(String text) {
+        if (awaitingForgetConfirm) {
+            awaitingForgetConfirm = false;
+            if (Memory.isYes(text)) {
+                memory.clear();
+                status.setText("Memory erased");
+                showLocalReply("ठीक आहे, मी सगळं विसरलो.");
+            } else {
+                status.setText("Forget cancelled");
+                showLocalReply("ठीक आहे, मी काहीही पुसलं नाही.");
+            }
+            return true;
+        }
+        if (Memory.isForgetAll(text)) {
+            if (memory.count() == 0) {
+                showLocalReply("माझ्या memory मध्ये काहीच नाही.");
+            } else {
+                awaitingForgetConfirm = true;
+                status.setText("Confirm: say YES (हो) to erase " + memory.count() + " facts");
+                showLocalReply("तुला खात्री आहे का? " + memory.count()
+                        + " गोष्टी कायमच्या पुसल्या जातील. हो म्हण.");
+            }
+            return true;
+        }
+        String fact = Memory.extractFact(text);
+        if (fact != null) {
+            if (fact.isEmpty()) {
+                status.setText("Nothing to remember in that sentence");
+                showLocalReply("काय लक्षात ठेवू ते सांग.");
+            } else if (memory.add(fact)) {
+                status.setText("Saved to memory");
+                showLocalReply("ठीक आहे, लक्षात ठेवलं: " + fact);
+            } else {
+                status.setText("Not saved (duplicate, empty or memory full)");
+                showLocalReply("हे आधीच लक्षात आहे किंवा memory भरली आहे.");
+            }
+            return true;
+        }
+        return false;
     }
 
     // ---- Step 7: on-device command layer - flashlight ----
