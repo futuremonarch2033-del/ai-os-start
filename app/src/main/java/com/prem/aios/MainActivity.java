@@ -77,6 +77,9 @@ public class MainActivity extends Activity {
     private int pendingTorch = 0;
     private TextView torchStatus;
     private Memory memory;
+    // Conversation history (in RAM only, cleared on app restart): alternating user/model turns
+    private final ArrayList<String[]> history = new ArrayList<String[]>();
+    private static final int MAX_HISTORY_TURNS = 12;
     private TextView memoryStatus;
     private Button viewMemoryBtn;
     private Button forgetBtn;
@@ -519,6 +522,14 @@ public class MainActivity extends Activity {
                             reply.setText("(no reply)");
                             maybeContinueLoop();
                         } else {
+                            synchronized (history) {
+                                history.add(new String[]{"user", userText});
+                                history.add(new String[]{"model", result});
+                                while (history.size() > MAX_HISTORY_TURNS * 2) {
+                                    history.remove(0);
+                                    history.remove(0);
+                                }
+                            }
                             status.setText("Done. LISTEN again?");
                             reply.setText(result);
                             lastReply = result;
@@ -555,11 +566,18 @@ public class MainActivity extends Activity {
                             + " Always reply in Marathi, in 1-3 short sentences."
                             + " If asked who made you, say Prem Chavan created you."
                             + " Never claim Google or any company made you.")));
-            JSONObject content = new JSONObject().put("parts",
-                    new JSONArray().put(new JSONObject().put("text", userText)));
+            JSONArray contents = new JSONArray();
+            synchronized (history) {
+                for (String[] h : history) {
+                    contents.put(new JSONObject().put("role", h[0]).put("parts",
+                            new JSONArray().put(new JSONObject().put("text", h[1]))));
+                }
+            }
+            contents.put(new JSONObject().put("role", "user").put("parts",
+                    new JSONArray().put(new JSONObject().put("text", userText))));
             JSONObject body = new JSONObject()
                     .put("system_instruction", system)
-                    .put("contents", new JSONArray().put(content));
+                    .put("contents", contents);
 
             OutputStream os = conn.getOutputStream();
             os.write(body.toString().getBytes("UTF-8"));
