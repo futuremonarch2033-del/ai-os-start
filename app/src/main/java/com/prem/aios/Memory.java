@@ -132,6 +132,52 @@ public class Memory {
         return null;
     }
 
+    /** Returns the fact to forget (trigger removed), or null if not a forget request. */
+    public static String extractForgetTarget(String text) {
+        String lower = text.toLowerCase(java.util.Locale.US);
+        String[] triggers = {"विसरून जा", "विसर", "विसरा", "forget about", "forget", "delete"};
+        for (String tr : triggers) {
+            int idx = lower.indexOf(tr);
+            if (idx >= 0) {
+                String t = (text.substring(0, idx) + " "
+                        + text.substring(idx + tr.length())).trim();
+                return t.replaceAll("^[,.:;\\-\\s]+|[,.:;\\-\\s]+$", "");
+            }
+        }
+        return null;
+    }
+
+    /** Facts containing the query (case-insensitive), or by 1-based number if query is digits. */
+    public synchronized List<String> find(String query) {
+        List<String> out = new ArrayList<String>();
+        List<String> facts = all();
+        String q = query.trim().toLowerCase(java.util.Locale.US);
+        if (q.matches("\\d{1,3}")) {
+            int n = Integer.parseInt(q);
+            if (n >= 1 && n <= facts.size()) {
+                out.add(facts.get(n - 1));
+            }
+            return out;
+        }
+        for (String f : facts) {
+            if (f.toLowerCase(java.util.Locale.US).contains(q)) {
+                out.add(f);
+            }
+        }
+        return out;
+    }
+
+    public synchronized boolean remove(String fact) {
+        List<String> facts = all();
+        for (int i = 0; i < facts.size(); i++) {
+            if (facts.get(i).equals(fact)) {
+                facts.remove(i);
+                return save(facts);
+            }
+        }
+        return false;
+    }
+
     public static boolean isForgetAll(String text) {
         String t = text.toLowerCase(java.util.Locale.US);
         boolean forget = t.contains("विसर") || t.contains("forget")
