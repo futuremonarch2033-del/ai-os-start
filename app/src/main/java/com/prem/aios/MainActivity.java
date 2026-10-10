@@ -83,6 +83,7 @@ public class MainActivity extends Activity {
     private TextView memoryStatus;
     private Button viewMemoryBtn;
     private Button forgetBtn;
+    private Button clearChatBtn;
     private boolean awaitingForgetConfirm = false;
 
     @Override
@@ -103,6 +104,8 @@ public class MainActivity extends Activity {
         viewMemoryBtn.setText("VIEW MEMORY");
         forgetBtn = new Button(this);
         forgetBtn.setText("FORGET EVERYTHING");
+        clearChatBtn = new Button(this);
+        clearChatBtn.setText("CLEAR CONVERSATION");
         updateMemoryStatus();
 
         torchStatus = new TextView(this);
@@ -151,6 +154,7 @@ public class MainActivity extends Activity {
         layout.addView(playBtn, lp);
         layout.addView(viewMemoryBtn, lp);
         layout.addView(forgetBtn, lp);
+        layout.addView(clearChatBtn, lp);
         setContentView(layout);
 
         // ---- Step 7: flashlight (torch) setup ----
@@ -207,6 +211,13 @@ public class MainActivity extends Activity {
                         .setMessage(memory.asDisplay())
                         .setPositiveButton("OK", null)
                         .show();
+            }
+        });
+
+        clearChatBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                clearConversation();
             }
         });
 
@@ -699,7 +710,30 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    private void clearConversation() {
+        int n;
+        synchronized (history) {
+            n = history.size() / 2;
+            history.clear();
+        }
+        status.setText("Conversation cleared (" + n + " exchanges). Memory facts kept.");
+    }
+
+    private boolean isClearConversation(String text) {
+        String t = text.toLowerCase(Locale.US);
+        return t.contains("संभाषण") || t.contains("conversation")
+                || t.contains("चॅट") || t.contains("chat history");
+    }
+
     private boolean handleMemoryCommand(String text) {
+        String tl = text.toLowerCase(Locale.US);
+        if (isClearConversation(text) && (tl.contains("clear") || tl.contains("reset")
+                || tl.contains("पुसून") || tl.contains("नवीन") || tl.contains("सुरू नव्याने")
+                || tl.contains("साफ"))) {
+            clearConversation();
+            showLocalReply("ठीक आहे, संभाषण पुसलं. तुझ्या memory मधल्या गोष्टी तशाच आहेत.");
+            return true;
+        }
         if (awaitingForgetConfirm) {
             awaitingForgetConfirm = false;
             if (Memory.isYes(text)) {
