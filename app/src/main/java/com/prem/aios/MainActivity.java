@@ -705,6 +705,29 @@ public class MainActivity extends Activity {
             }
             return true;
         }
+        String target = Memory.extractForgetTarget(text);
+        if (target != null) {
+            if (target.isEmpty()) {
+                status.setText("Forget: say which fact");
+                showLocalReply("कोणती गोष्ट विसरू ते सांग.");
+                return true;
+            }
+            java.util.List<String> hits = memory.find(target);
+            if (hits.isEmpty()) {
+                status.setText("Forget: no matching fact");
+                showLocalReply("तसं काही माझ्या memory मध्ये सापडलं नाही.");
+            } else if (hits.size() > 1) {
+                status.setText("Forget: " + hits.size() + " facts match, be more specific");
+                showLocalReply("अनेक गोष्टी जुळतात, नीट सांग. VIEW MEMORY मध्ये पहा.");
+            } else if (memory.remove(hits.get(0))) {
+                status.setText("Forgot: " + hits.get(0));
+                showLocalReply("ठीक आहे, विसरलो: " + hits.get(0));
+            } else {
+                status.setText("Error: could not delete fact");
+                showLocalReply("त्रुटी: ती गोष्ट पुसता आली नाही.");
+            }
+            return true;
+        }
         String fact = Memory.extractFact(text);
         if (fact != null) {
             if (fact.isEmpty()) {
