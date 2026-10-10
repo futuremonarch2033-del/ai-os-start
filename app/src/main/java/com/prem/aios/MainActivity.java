@@ -710,6 +710,96 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    private void saveFactAsync(final String raw) {
+        final String apiKey = BuildConfig.GEMINI_API_KEY;
+        if (apiKey == null || apiKey.isEmpty()) {
+            finishSave(raw, "no API key, saved as spoken");
+            return;
+        }
+        status.setText("Saving to memory...");
+        reply.setText("...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String compact = compressFact(apiKey, raw);
+                final String fact;
+                final String how;
+                if (compact == null) {
+                    fact = raw;
+                    how = "compression failed, saved as spoken";
+                } else {
+                    fact = compact;
+                    how = "shortened by Gemini from: " + raw;
+                }
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        finishSave(fact, how);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void finishSave(String fact, String how) {
+        if (memory.add(fact)) {
+            status.setText("Saved (" + how + ")");
+            showLocalReply("ठीक आहे, लक्षात ठेवलं: " + fact);
+        } else {
+            status.setText("Not saved (duplicate, empty or memory full)");
+            showLocalReply("हे आधीच लक्षात आहे किंवा memory भरली आहे.");
+        }
+    }
+
+    /** One Gemini call: sentence -> short fact. Returns null on any failure. */
+    private String compressFact(String apiKey, String raw) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(GEMINI_URL).openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            conn.setRequestProperty("x-goog-api-key", apiKey);
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(15000);
+            conn.setDoOutput(true);
+            JSONObject system = new JSONObject().put("parts",
+                    new JSONArray().put(new JSONObject().put("text",
+                            "Rewrite the user's sentence as ONE short factual statement about the user"
+                            + " (the speaker). Keep the same language as the input. Keep every name,"
+                            + " number and detail. Add nothing new. Output only the statement, no quotes.")));
+            JSONObject content = new JSONObject().put("role", "user").put("parts",
+                    new JSONArray().put(new JSONObject().put("text", raw)));
+            JSONObject body = new JSONObject()
+                    .put("system_instruction", system)
+                    .put("contents", new JSONArray().put(content));
+            OutputStream os = conn.getOutputStream();
+            os.write(body.toString().getBytes("UTF-8"));
+            os.close();
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                return null;
+            }
+            JSONObject root = new JSONObject(readAll(conn.getInputStream()));
+            JSONArray parts = root.getJSONArray("candidates").getJSONObject(0)
+                    .getJSONObject("content").getJSONArray("parts");
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < parts.length(); i++) {
+                sb.append(parts.getJSONObject(i).optString("text", ""));
+            }
+            String out = sb.toString().trim();
+            if (out.isEmpty() || out.length() > raw.length() * 2 + 40 || out.contains("\n")) {
+                return null;
+            }
+            return out;
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
     private void clearConversation() {
         int n;
         synchronized (history) {
@@ -785,12 +875,8 @@ public class MainActivity extends Activity {
             if (fact.isEmpty()) {
                 status.setText("Nothing to remember in that sentence");
                 showLocalReply("काय लक्षात ठेवू ते सांग.");
-            } else if (memory.add(fact)) {
-                status.setText("Saved to memory");
-                showLocalReply("ठीक आहे, लक्षात ठेवलं: " + fact);
             } else {
-                status.setText("Not saved (duplicate, empty or memory full)");
-                showLocalReply("हे आधीच लक्षात आहे किंवा memory भरली आहे.");
+                saveFactAsync(fact);
             }
             return true;
         }
