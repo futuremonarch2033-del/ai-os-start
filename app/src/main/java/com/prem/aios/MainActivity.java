@@ -84,6 +84,13 @@ public class MainActivity extends Activity {
     private Button viewMemoryBtn;
     private Button forgetBtn;
     private Button clearChatBtn;
+    private static final int REQ_NOTIF = 1003;
+    private TextView reminderStatus;
+    private Button viewRemindersBtn;
+    private boolean awaitingReminderConfirm = false;
+    private Reminders.Item pendingReminder = null;
+    private boolean awaitingSettingsReturn = false;
+    private long settingsLaunchedAt = 0L;
     private boolean awaitingForgetConfirm = false;
 
     @Override
@@ -106,6 +113,12 @@ public class MainActivity extends Activity {
         forgetBtn.setText("FORGET EVERYTHING");
         clearChatBtn = new Button(this);
         clearChatBtn.setText("CLEAR CONVERSATION");
+        reminderStatus = new TextView(this);
+        reminderStatus.setTextSize(18f);
+        reminderStatus.setGravity(Gravity.CENTER);
+        viewRemindersBtn = new Button(this);
+        viewRemindersBtn.setText("VIEW REMINDERS");
+        updateReminderStatus();
         updateMemoryStatus();
 
         torchStatus = new TextView(this);
@@ -146,6 +159,7 @@ public class MainActivity extends Activity {
         layout.addView(status, lp);
         layout.addView(torchStatus, lp);
         layout.addView(memoryStatus, lp);
+        layout.addView(reminderStatus, lp);
         layout.addView(listenBtn, lp);
         layout.addView(transcript, lp);
         layout.addView(reply, lp);
@@ -155,6 +169,7 @@ public class MainActivity extends Activity {
         layout.addView(viewMemoryBtn, lp);
         layout.addView(forgetBtn, lp);
         layout.addView(clearChatBtn, lp);
+        layout.addView(viewRemindersBtn, lp);
         setContentView(layout);
 
         // ---- Step 7: flashlight (torch) setup ----
@@ -211,6 +226,13 @@ public class MainActivity extends Activity {
                         .setMessage(memory.asDisplay())
                         .setPositiveButton("OK", null)
                         .show();
+            }
+        });
+
+        viewRemindersBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showRemindersDialog();
             }
         });
 
@@ -348,6 +370,18 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions,
                                            int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_NOTIF) {
+            if (grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                tryArmPending();
+            } else {
+                pendingReminder = null;
+                status.setText("Notification permission DENIED - reminder NOT set."
+                        + " Enable: Settings > Apps > this app > Notifications");
+                reply.setText("(reminder not set)");
+            }
+            return;
+        }
         if (requestCode == REQ_CAMERA) {
             if (grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
@@ -443,7 +477,8 @@ public class MainActivity extends Activity {
                     status.setText("Error: empty result");
                 } else {
                     transcript.setText(text);
-                    if (!handleMemoryCommand(text) && !handleLocalCommand(text)) {
+                    if (!handleReminderCommand(text) && !handleMemoryCommand(text)
+                            && !handleLocalCommand(text)) {
                         askGemini(text);
                     }
                 }
@@ -801,6 +836,268 @@ public class MainActivity extends Activity {
                 return null;
             }
             return out;
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    // ---- Reminders ----
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (awaitingSettingsReturn && pendingReminder != null
+                && System.currentTimeMillis() - settingsLaunchedAt > 1500) {
+            awaitingSettingsReturn = false;
+            tryArmPending();
+        }
+        updateReminderStatus();
+    }
+
+    private void updateReminderStatus() {
+        reminderStatus.setText("Reminders: " + Reminders.all(this).size() + " pending");
+    }
+
+    private boolean handleReminderCommand(String text) {
+        if (awaitingReminderConfirm) {
+            awaitingReminderConfirm = false;
+            if (Memory.isYes(text)) {
+                tryArmPending();
+            } else {
+                pendingReminder = null;
+                status.setText("Reminder cancelled (not set)");
+                showLocalReply("ठीक आहे, रिमाइंडर रद्द केला.");
+            }
+            return true;
+        }
+        String t = text.toLowerCase(Locale.US);
+        if (t.contains("आठवण") || t.contains("remind")) {
+            parseReminderAsync(text);
+            return true;
+        }
+        return false;
+    }
+
+    private void parseReminderAsync(final String raw) {
+        final String apiKey = BuildConfig.GEMINI_API_KEY;
+        if (apiKey == null || apiKey.isEmpty()) {
+            status.setText("No API key in this build - cannot parse reminder");
+            return;
+        }
+        status.setText("Understanding reminder...");
+        reply.setText("...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String now = new java.text.SimpleDateFormat("EEEE, yyyy-MM-dd HH:mm",
+                        Locale.US).format(new java.util.Date());
+                String tz = java.util.TimeZone.getDefault().getID();
+                String system = "Current local time: " + now + " (timezone " + tz + ")."
+                        + " Decide if the user's sentence asks to be reminded of something."
+                        + " Reply with ONLY a JSON object: {\"is_reminder\": true/false,"
+                        + " \"minutes_from_now\": number or null,"
+                        + " \"at\": \"yyyy-MM-dd HH:mm\" or null,"
+                        + " \"text\": short reminder text in the user's language}."
+                        + " Use minutes_from_now for relative times (\"in 10 minutes\"),"
+                        + " and at for clock times (\"at 6 pm\", \"tomorrow 7 am\"; if a clock"
+                        + " time today has already passed, use tomorrow). If no time is given,"
+                        + " set both to null.";
+                final String json = callGeminiJson(apiKey, system, raw);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        onReminderParsed(raw, json);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void onReminderParsed(String raw, String json) {
+        if (json == null) {
+            status.setText("Error: could not parse reminder (network or Gemini failed) - not set");
+            reply.setText("(reminder not set)");
+            maybeContinueLoop();
+            return;
+        }
+        try {
+            String j = json.trim();
+            if (j.startsWith("```")) {
+                j = j.replaceAll("^```[a-zA-Z]*", "").replaceAll("```$", "").trim();
+            }
+            JSONObject o = new JSONObject(j);
+            if (!o.optBoolean("is_reminder", false)) {
+                askGemini(raw);
+                return;
+            }
+            long now = System.currentTimeMillis();
+            long time = 0L;
+            if (!o.isNull("minutes_from_now") && o.optDouble("minutes_from_now", 0) > 0) {
+                time = now + (long) (o.optDouble("minutes_from_now") * 60000.0);
+            } else if (!o.isNull("at")) {
+                java.util.Date d = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm",
+                        Locale.US).parse(o.optString("at"));
+                if (d != null) {
+                    time = d.getTime();
+                }
+            }
+            String rtext = o.optString("text", "").trim();
+            if (rtext.isEmpty() || rtext.equals("null")) {
+                rtext = raw;
+            }
+            if (time <= now + 5000 || time > now + 366L * 24 * 3600 * 1000) {
+                status.setText("Reminder NOT set: could not get a valid future time from: " + raw);
+                showLocalReply("वेळ समजली नाही. कधी आठवण करू ते पुन्हा सांग.");
+                return;
+            }
+            Reminders.Item it = new Reminders.Item();
+            it.id = now;
+            it.time = time;
+            it.text = rtext;
+            pendingReminder = it;
+            awaitingReminderConfirm = true;
+            status.setText("Confirm reminder: \"" + rtext + "\" at "
+                    + Reminders.format(time) + " - say YES (हो) to set it");
+            showLocalReply("रिमाइंडर: " + rtext + ", " + Reminders.format(time)
+                    + ". बरोबर असेल तर हो म्हण.");
+        } catch (Exception e) {
+            status.setText("Error: reminder parse failed (" + e.getMessage() + ") - not set");
+            reply.setText("(reminder not set)");
+            maybeContinueLoop();
+        }
+    }
+
+    private void tryArmPending() {
+        if (pendingReminder == null) {
+            return;
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                != PackageManager.PERMISSION_GRANTED) {
+            status.setText("Allow notifications to set the reminder (NOT set yet)");
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIF);
+            return;
+        }
+        if (!Reminders.canExact(this)) {
+            status.setText("Turn ON 'Alarms & reminders' for this app, then come back."
+                    + " Reminder NOT set yet.");
+            awaitingSettingsReturn = true;
+            settingsLaunchedAt = System.currentTimeMillis();
+            try {
+                startActivity(new Intent(
+                        android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                        android.net.Uri.parse("package:" + getPackageName())));
+            } catch (Exception e) {
+                status.setText("Error: cannot open Alarms & reminders settings. Open it manually:"
+                        + " Settings > Apps > Special access > Alarms & reminders");
+            }
+            return;
+        }
+        Reminders.Item it = pendingReminder;
+        pendingReminder = null;
+        if (it.time <= System.currentTimeMillis() + 2000) {
+            status.setText("Reminder NOT set: time already passed");
+            showLocalReply("ती वेळ निघून गेली आहे, रिमाइंडर सेट झाला नाही.");
+            return;
+        }
+        String err = Reminders.arm(this, it);
+        if (err != null) {
+            status.setText("Error: reminder NOT set - " + err);
+            showLocalReply("रिमाइंडर सेट झाला नाही.");
+            return;
+        }
+        if (!Reminders.add(this, it)) {
+            Reminders.disarm(this, it);
+            status.setText("Error: could not save reminder - NOT set");
+            showLocalReply("रिमाइंडर सेव्ह झाला नाही.");
+            return;
+        }
+        updateReminderStatus();
+        status.setText("Reminder SET for " + Reminders.format(it.time));
+        showLocalReply("रिमाइंडर सेट झाला: " + it.text + ", " + Reminders.format(it.time));
+    }
+
+    private void showRemindersDialog() {
+        final java.util.List<Reminders.Item> items = Reminders.all(this);
+        if (items.isEmpty()) {
+            new AlertDialog.Builder(this).setTitle("Reminders: 0")
+                    .setMessage("(no pending reminders)")
+                    .setPositiveButton("OK", null).show();
+            return;
+        }
+        String[] labels = new String[items.size()];
+        for (int i = 0; i < items.size(); i++) {
+            labels[i] = Reminders.format(items.get(i).time) + " - " + items.get(i).text;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Reminders: " + items.size() + " (tap one to cancel it)")
+                .setItems(labels, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        confirmCancelReminder(items.get(which));
+                    }
+                })
+                .setPositiveButton("CLOSE", null)
+                .show();
+    }
+
+    private void confirmCancelReminder(final Reminders.Item it) {
+        new AlertDialog.Builder(this)
+                .setTitle("Cancel this reminder?")
+                .setMessage(Reminders.format(it.time) + " - " + it.text)
+                .setPositiveButton("YES, CANCEL", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        Reminders.disarm(MainActivity.this, it);
+                        Reminders.remove(MainActivity.this, it.id);
+                        updateReminderStatus();
+                        status.setText("Reminder cancelled");
+                    }
+                })
+                .setNegativeButton("KEEP", null)
+                .show();
+    }
+
+    /** One Gemini call returning JSON text, or null on any failure. */
+    private String callGeminiJson(String apiKey, String system, String userText) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(GEMINI_URL).openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            conn.setRequestProperty("x-goog-api-key", apiKey);
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(20000);
+            conn.setDoOutput(true);
+            JSONObject sys = new JSONObject().put("parts",
+                    new JSONArray().put(new JSONObject().put("text", system)));
+            JSONObject content = new JSONObject().put("role", "user").put("parts",
+                    new JSONArray().put(new JSONObject().put("text", userText)));
+            JSONObject body = new JSONObject()
+                    .put("system_instruction", sys)
+                    .put("contents", new JSONArray().put(content))
+                    .put("generationConfig", new JSONObject()
+                            .put("responseMimeType", "application/json"));
+            OutputStream os = conn.getOutputStream();
+            os.write(body.toString().getBytes("UTF-8"));
+            os.close();
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                return null;
+            }
+            JSONObject root = new JSONObject(readAll(conn.getInputStream()));
+            JSONArray parts = root.getJSONArray("candidates").getJSONObject(0)
+                    .getJSONObject("content").getJSONArray("parts");
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < parts.length(); i++) {
+                sb.append(parts.getJSONObject(i).optString("text", ""));
+            }
+            String out = sb.toString().trim();
+            return out.isEmpty() ? null : out;
         } catch (Exception e) {
             return null;
         } finally {
