@@ -46,12 +46,74 @@ const providers = {
   },
 };
 
-// ---- Tool interface: each tool {name, needsConfirm, run(args, env)} ----
+// ---- Tool interface: each tool {description, parameters, needsConfirm, run(args, env)} ----
+// needsConfirm tools never run from the model's own say-so; see runTool.
 const tools = {
-  memory_list: { needsConfirm: false, run: async (a, env) => (env.MEM ? await memGet(env) : []) },
+  get_datetime: {
+    description: "Get the current date, weekday and time. Use whenever the user asks what time, date or day it is, or needs a relative date worked out. Default timezone is Asia/Kolkata (IST).",
+    parameters: { type: "object", properties: { timezone: { type: "string", description: "IANA timezone, e.g. Asia/Kolkata. Optional." } } },
+    needsConfirm: false,
+    async run(a) {
+      const tz = a.timezone || "Asia/Kolkata";
+      const now = new Date();
+      const fmt = (o) => new Intl.DateTimeFormat("en-GB", { timeZone: tz, ...o }).format(now);
+      return {
+        timezone: tz,
+        date: fmt({ year: "numeric", month: "long", day: "numeric" }),
+        weekday: fmt({ weekday: "long" }),
+        time_24h: fmt({ hour: "2-digit", minute: "2-digit", hour12: false }),
+        time_12h: new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit", hour12: true }).format(now),
+        iso_utc: now.toISOString(),
+      };
+    },
+  },
 };
-async function memGet(env) {
-  return JSON.parse((await env.MEM.get("facts")) || "[]");
+
+function toolDeclarations() {
+  return [{ functionDeclarations: Object.entries(tools).map(([name, t]) => ({ name, description: t.description, parameters: t.parameters })) }];
+}
+
+// Runs one tool call. Every call is logged (name, args, outcome, timing; never secrets).
+async function runTool(name, args, env) {
+  const t = tools[name];
+  const started = Date.now();
+  if (!t) {
+    log("tool_call", { tool: name, args, ok: false, error: "unknown tool" });
+    return { error: `unknown tool ${name}` };
+  }
+  if (t.needsConfirm) {
+    log("tool_call", { tool: name, args, ok: false, error: "needs user confirmation" });
+    return { error: "this tool needs explicit user confirmation and is not available yet" };
+  }
+  try {
+    const result = await t.run(args || {}, env);
+    log("tool_call", { tool: name, args, ok: true, ms: Date.now() - started });
+    return result;
+  } catch (e) {
+    log("tool_call", { tool: name, args, ok: false, ms: Date.now() - started, error: String(e.message).slice(0, 200) });
+    return { error: String(e.message) };
+  }
+}
+
+// Gemini call with the tool loop. Tools are on for the chat request only (not JSON-mode or memory-compress calls).
+async function generateWithTools(env, body, wantTools) {
+  if (!wantTools) return await geminiGenerate(env, body);
+  const contents = [...body.contents];
+  const reqBody = { ...body, contents, tools: toolDeclarations() };
+  for (let i = 0; i < 4; i++) {
+    const out = await geminiGenerate(env, reqBody);
+    const content = out.candidates?.[0]?.content;
+    const calls = (content?.parts || []).filter((p) => p.functionCall);
+    if (!calls.length) return out;
+    contents.push(content);
+    const responses = [];
+    for (const p of calls) {
+      const r = await runTool(p.functionCall.name, p.functionCall.args, env);
+      responses.push({ functionResponse: { name: p.functionCall.name, response: { result: r } } });
+    }
+    contents.push({ role: "user", parts: responses });
+  }
+  throw new Error("tool loop did not finish after 4 rounds");
 }
 
 function log(event, data) {
@@ -87,7 +149,9 @@ export default {
       if (!Array.isArray(body.contents)) return json({ ok: false, error: "contents is required" }, 400);
       const started = Date.now();
       try {
-        const out = await geminiGenerate(env, { system_instruction: body.system_instruction, contents: body.contents, generationConfig: body.generationConfig });
+        const sysText = JSON.stringify(body.system_instruction || "");
+        const wantTools = !body.generationConfig?.responseMimeType && (req.headers.get("x-brain-tools") === "1" || sysText.includes("voice assistant"));
+        const out = await generateWithTools(env, { system_instruction: body.system_instruction, contents: body.contents, generationConfig: body.generationConfig }, wantTools);
         log("generate_ok", { ms: Date.now() - started });
         return json(out);
       } catch (e) {
