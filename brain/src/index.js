@@ -45,6 +45,12 @@ const json = (obj, status = 200) =>
 
 export default {
   async fetch(req, env) {
+    // On Deno Deploy the second argument is not our env, so read Deno.env instead.
+    if (typeof Deno !== "undefined") {
+      const g = (k) => Deno.env.get(k) || undefined;
+      env = { GEMINI_API_KEY: g("GEMINI_API_KEY"), BRAIN_TOKEN: g("BRAIN_TOKEN"), PROVIDER: g("PROVIDER"), GEMINI_MODEL: g("GEMINI_MODEL") };
+    }
+    env = env || {};
     const url = new URL(req.url);
     if (url.pathname === "/health") {
       return json({ ok: true, provider: env.PROVIDER || "gemini", geminiKeySet: !!env.GEMINI_API_KEY, tokenSet: !!env.BRAIN_TOKEN });
