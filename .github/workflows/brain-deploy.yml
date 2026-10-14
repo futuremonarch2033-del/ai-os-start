@@ -1,0 +1,78 @@
+name: Brain deploy
+
+on:
+  push:
+    branches: [brain]
+    paths:
+      - "brain/**"
+      - ".github/workflows/brain-deploy.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      BRAIN_TOKEN: ${{ secrets.BRAIN_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets
+        run: |
+          missing=""
+          [ -z "$CLOUDFLARE_API_TOKEN" ] && missing="$missing CLOUDFLARE_API_TOKEN"
+          [ -z "$GEMINI_API_KEY" ] && missing="$missing GEMINI_API_KEY"
+          [ -z "$BRAIN_TOKEN" ] && missing="$missing BRAIN_TOKEN"
+          if [ -n "$missing" ]; then echo "MISSING SECRETS:$missing"; exit 1; fi
+          echo "all secrets present"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Local unit test (mocked)
+        working-directory: brain
+        run: node test.mjs
+
+      - name: Find account and workers.dev subdomain
+        id: acct
+        run: |
+          set -e
+          accts=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" https://api.cloudflare.com/client/v4/accounts)
+          echo "$accts" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(!j.success){console.log("ACCOUNTS ERROR",JSON.stringify(j.errors));process.exit(1)}console.log("accounts:",j.result.length)})'
+          id=$(echo "$accts" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).result[0].id))')
+          echo "CLOUDFLARE_ACCOUNT_ID=$id" >> "$GITHUB_ENV"
+          sub=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" https://api.cloudflare.com/client/v4/accounts/$id/workers/subdomain | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);console.log(j.result&&j.result.subdomain||"")})')
+          if [ -z "$sub" ]; then
+            echo "no workers.dev subdomain yet, registering"
+            sub="prem-ai-brain"
+            curl -s -X PUT -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" --data "{\"subdomain\":\"$sub\"}" https://api.cloudflare.com/client/v4/accounts/$id/workers/subdomain | head -c 300
+            echo
+          fi
+          echo "SUBDOMAIN=$sub" >> "$GITHUB_ENV"
+          echo "subdomain: $sub"
+
+      - name: Deploy Worker
+        working-directory: brain
+        run: npx --yes wrangler@4 deploy
+
+      - name: Set Worker secrets
+        working-directory: brain
+        run: |
+          printf '%s' "$GEMINI_API_KEY" | npx --yes wrangler@4 secret put GEMINI_API_KEY
+          printf '%s' "$BRAIN_TOKEN" | npx --yes wrangler@4 secret put BRAIN_TOKEN
+
+      - name: Real round trip
+        run: |
+          url="https://prem-brain.${SUBDOMAIN}.workers.dev"
+          echo "URL: $url"
+          sleep 8
+          echo "--- /health"
+          curl -s -m 30 "$url/health"; echo
+          echo "--- /ask without token (expect 401)"
+          curl -s -m 30 -o /dev/null -w "%{http_code}\n" -X POST "$url/ask" -d '{"text":"hi"}'
+          echo "--- /ask real"
+          curl -s -m 60 -w "\nHTTP %{http_code}\n" -X POST "$url/ask" \
+            -H "Authorization: Bearer $BRAIN_TOKEN" -H "Content-Type: application/json" \
+            --data '{"text":"भारताची राजधानी कोणती?"}'

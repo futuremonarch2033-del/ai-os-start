@@ -2,10 +2,10 @@ plugins {
     id("com.android.application")
 }
 
-// Injected by the GitHub Actions workflow from the GEMINI_API_KEY repo secret.
+// Injected by the GitHub Actions workflow from the BRAIN_TOKEN repo secret.
 // Empty when the secret does not exist yet - the app then shows an honest
 // "no API key in this build" message instead of crashing.
-val geminiApiKey = providers.environmentVariable("GEMINI_API_KEY").orNull ?: ""
+val brainToken = providers.environmentVariable("BRAIN_TOKEN").orNull ?: ""
 
 android {
     namespace = "com.prem.aios"
@@ -17,7 +17,7 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
-        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
+        buildConfigField("String", "BRAIN_TOKEN", "\"$brainToken\"")
     }
 
     buildFeatures {
