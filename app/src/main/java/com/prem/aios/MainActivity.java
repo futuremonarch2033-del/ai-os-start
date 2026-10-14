@@ -69,6 +69,7 @@ public class MainActivity extends Activity {
     private String lastReply = "";
     private Button replayBtn;
     private boolean loopActive = false;
+    private int consecutiveSilence = 0;
     private int consecutiveListenErrors = 0;
     private CameraManager cameraManager;
     private String torchCameraId;
@@ -270,6 +271,7 @@ public class MainActivity extends Activity {
                 } else {
                     loopActive = true;
                     consecutiveListenErrors = 0;
+                    consecutiveSilence = 0;
                     ensureMicPermission(ACT_LISTEN);
                 }
             }
@@ -453,7 +455,17 @@ public class MainActivity extends Activity {
                 listening = false;
                 if (loopActive) {
                     consecutiveListenErrors++;
-                    if (consecutiveListenErrors >= 5) {
+                    boolean silence = (error == SpeechRecognizer.ERROR_NO_MATCH
+                            || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT);
+                    if (silence) {
+                        consecutiveSilence++;
+                    }
+                    if (consecutiveSilence >= 3) {
+                        loopActive = false;
+                        consecutiveSilence = 0;
+                        listenBtn.setText("LISTEN");
+                        status.setText("Conversation ended (no speech heard 3 times). LISTEN to start again");
+                    } else if (consecutiveListenErrors >= 5) {
                         loopActive = false;
                         listenBtn.setText("LISTEN");
                         status.setText("Stopped after repeated errors: " + errorText(error));
@@ -472,6 +484,7 @@ public class MainActivity extends Activity {
             public void onResults(Bundle results) {
                 listening = false;
                 consecutiveListenErrors = 0;
+                consecutiveSilence = 0;
                 if (!loopActive) {
                     listenBtn.setText("LISTEN");
                 }
@@ -706,10 +719,14 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 if (loopActive && !listening) {
+                    if (tts != null && tts.isSpeaking()) {
+                        maybeContinueLoop();
+                        return;
+                    }
                     startListening();
                 }
             }
-        }, 400);
+        }, 700);
     }
 
     // ---- Step 4: speak the reply aloud (Marathi voice) ----
