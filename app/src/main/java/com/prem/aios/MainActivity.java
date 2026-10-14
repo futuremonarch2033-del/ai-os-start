@@ -44,7 +44,7 @@ public class MainActivity extends Activity {
     private static final String ACT_RECORD = "record";
     private static final String ACT_LISTEN = "listen";
     private static final String GEMINI_URL =
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
+            "https://prem-brain--brain.futuremonarch2033-del.deno.net/generate";
 
     private TextView status;
     private TextView transcript;
@@ -549,9 +549,9 @@ public class MainActivity extends Activity {
     // ---- Step 3: send transcript to Gemini brain, show reply ----
 
     private void askGemini(final String userText) {
-        final String apiKey = BuildConfig.GEMINI_API_KEY;
+        final String apiKey = BuildConfig.BRAIN_TOKEN;
         if (apiKey == null || apiKey.isEmpty()) {
-            status.setText("No API key in this build - add GitHub secret and rebuild");
+            status.setText("No BRAIN_TOKEN in this build - add GitHub secret and rebuild");
             return;
         }
         status.setText("Thinking...");
@@ -598,7 +598,7 @@ public class MainActivity extends Activity {
             conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-            conn.setRequestProperty("x-goog-api-key", apiKey);
+            conn.setRequestProperty("Authorization", "Bearer " + apiKey);
             conn.setConnectTimeout(20000);
             conn.setReadTimeout(30000);
             conn.setDoOutput(true);
@@ -756,7 +756,7 @@ public class MainActivity extends Activity {
     }
 
     private void saveFactAsync(final String raw) {
-        final String apiKey = BuildConfig.GEMINI_API_KEY;
+        final String apiKey = BuildConfig.BRAIN_TOKEN;
         if (apiKey == null || apiKey.isEmpty()) {
             finishSave(raw, "no API key, saved as spoken");
             return;
@@ -803,7 +803,7 @@ public class MainActivity extends Activity {
             conn = (HttpURLConnection) new URL(GEMINI_URL).openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-            conn.setRequestProperty("x-goog-api-key", apiKey);
+            conn.setRequestProperty("Authorization", "Bearer " + apiKey);
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(15000);
             conn.setDoOutput(true);
@@ -883,7 +883,7 @@ public class MainActivity extends Activity {
     }
 
     private void parseReminderAsync(final String raw) {
-        final String apiKey = BuildConfig.GEMINI_API_KEY;
+        final String apiKey = BuildConfig.BRAIN_TOKEN;
         if (apiKey == null || apiKey.isEmpty()) {
             status.setText("No API key in this build - cannot parse reminder");
             return;
@@ -1069,7 +1069,7 @@ public class MainActivity extends Activity {
             conn = (HttpURLConnection) new URL(GEMINI_URL).openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-            conn.setRequestProperty("x-goog-api-key", apiKey);
+            conn.setRequestProperty("Authorization", "Bearer " + apiKey);
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(20000);
             conn.setDoOutput(true);
