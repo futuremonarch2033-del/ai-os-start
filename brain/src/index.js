@@ -11,12 +11,20 @@ async function geminiGenerate(env, body) {
   for (const model of models) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
     for (let attempt = 0; attempt < 2; attempt++) {
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
-        body: JSON.stringify(body),
-      });
-      const t = await r.text();
+      let r, t;
+      try {
+        r = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(Number(env.MODEL_TIMEOUT_MS) || 12000),
+        });
+        t = await r.text();
+      } catch (e) {
+        // Timeout or network error: record it and fall through to the next model.
+        errs.push(`${model} ${e.name === "TimeoutError" ? "timed out" : "network error: " + e.message}`);
+        break;
+      }
       if (r.ok) return JSON.parse(t);
       errs.push(`${model} HTTP ${r.status}: ${t.replace(/\s+/g, " ").slice(0, 160)}`);
       if (r.status !== 503 && r.status !== 429) break;
@@ -59,7 +67,7 @@ export default {
     // On Deno Deploy the second argument is not our env, so read Deno.env instead.
     if (typeof Deno !== "undefined") {
       const g = (k) => Deno.env.get(k) || undefined;
-      env = { GEMINI_API_KEY: g("GEMINI_API_KEY"), BRAIN_TOKEN: g("BRAIN_TOKEN"), PROVIDER: g("PROVIDER"), GEMINI_MODEL: g("GEMINI_MODEL") };
+      env = { GEMINI_API_KEY: g("GEMINI_API_KEY"), BRAIN_TOKEN: g("BRAIN_TOKEN"), PROVIDER: g("PROVIDER"), GEMINI_MODEL: g("GEMINI_MODEL"), MODEL_TIMEOUT_MS: g("MODEL_TIMEOUT_MS") };
     }
     env = env || {};
     const url = new URL(req.url);
