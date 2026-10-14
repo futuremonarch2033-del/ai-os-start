@@ -89,6 +89,9 @@ public class MainActivity extends Activity {
     private Button viewRemindersBtn;
     private boolean awaitingReminderConfirm = false;
     private Reminders.Item pendingReminder = null;
+    private boolean awaitingAlarmConfirm = false;
+    private int pendingAlarmHour = -1, pendingAlarmMin = -1;
+    private String pendingAlarmLabel = "";
     private boolean awaitingSettingsReturn = false;
     private long settingsLaunchedAt = 0L;
     private boolean awaitingForgetConfirm = false;
@@ -477,7 +480,7 @@ public class MainActivity extends Activity {
                     status.setText("Error: empty result");
                 } else {
                     transcript.setText(text);
-                    if (!handleReminderCommand(text) && !handleMemoryCommand(text)
+                    if (!handleReminderCommand(text) && !handleAlarmCommand(text) && !handleMemoryCommand(text)
                             && !handleLocalCommand(text)) {
                         askGemini(text);
                     }
@@ -559,7 +562,9 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final String result = callGemini(apiKey, userText);
+                String r0 = callGemini(apiKey, userText);
+                if (r0.startsWith("Error:")) { r0 = callGemini(apiKey, userText); }
+                final String result = r0;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
@@ -600,7 +605,8 @@ public class MainActivity extends Activity {
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             conn.setRequestProperty("Authorization", "Bearer " + apiKey);
             conn.setConnectTimeout(20000);
-            conn.setReadTimeout(30000);
+            conn.setReadTimeout(45000);
+            conn.setRequestProperty("x-brain-tools", "1");
             conn.setDoOutput(true);
 
             String today = new java.text.SimpleDateFormat("EEEE, d MMMM yyyy",
@@ -805,7 +811,7 @@ public class MainActivity extends Activity {
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             conn.setRequestProperty("Authorization", "Bearer " + apiKey);
             conn.setConnectTimeout(10000);
-            conn.setReadTimeout(15000);
+            conn.setReadTimeout(25000);
             conn.setDoOutput(true);
             JSONObject system = new JSONObject().put("parts",
                     new JSONArray().put(new JSONObject().put("text",
@@ -842,6 +848,123 @@ public class MainActivity extends Activity {
             if (conn != null) {
                 conn.disconnect();
             }
+        }
+    }
+
+    // ---- Device alarm (system clock app). Needs the user's explicit "हो" before it is set. ----
+
+    private boolean handleAlarmCommand(String text) {
+        if (awaitingAlarmConfirm) {
+            awaitingAlarmConfirm = false;
+            if (Memory.isYes(text)) {
+                setSystemAlarm();
+            } else {
+                status.setText("Alarm cancelled (not set)");
+                showLocalReply("ठीक आहे, अलार्म रद्द केला.");
+            }
+            return true;
+        }
+        String t = text.toLowerCase(Locale.US);
+        if (t.contains("अलार्म") || t.contains("अलार्म") || t.contains("alarm") || t.contains("गजर")) {
+            parseAlarmAsync(text);
+            return true;
+        }
+        return false;
+    }
+
+    private void parseAlarmAsync(final String raw) {
+        final String apiKey = BuildConfig.BRAIN_TOKEN;
+        if (apiKey == null || apiKey.isEmpty()) {
+            status.setText("No BRAIN_TOKEN in this build - cannot set alarm");
+            return;
+        }
+        status.setText("Understanding alarm...");
+        reply.setText("...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String now = new java.text.SimpleDateFormat("EEEE, yyyy-MM-dd HH:mm",
+                        Locale.US).format(new java.util.Date());
+                String system = "Current local time: " + now + "."
+                        + " Decide if the user's sentence asks to set a device alarm."
+                        + " Reply with ONLY a JSON object: {\"is_alarm\": true/false,"
+                        + " \"hour\": 0-23 or null, \"minute\": 0-59 or null,"
+                        + " \"label\": short label or empty}."
+                        + " Convert spoken times to 24-hour (\"सकाळी 6\" = 6, \"संध्याकाळी 6\" = 18)."
+                        + " If no clock time is given, set hour and minute to null.";
+                String j0 = callGeminiJson(apiKey, system, raw);
+                if (j0 == null) { j0 = callGeminiJson(apiKey, system, raw); }
+                final String json = j0;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        onAlarmParsed(raw, json);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void onAlarmParsed(String raw, String json) {
+        if (json == null) {
+            status.setText("Error: could not parse alarm (network or Gemini failed) - not set");
+            reply.setText("(alarm not set)");
+            maybeContinueLoop();
+            return;
+        }
+        try {
+            String j = json.trim();
+            if (j.startsWith("```")) {
+                j = j.replaceAll("^```[a-zA-Z]*", "").replaceAll("```$", "").trim();
+            }
+            JSONObject o = new JSONObject(j);
+            if (!o.optBoolean("is_alarm", false)) {
+                askGemini(raw);
+                return;
+            }
+            if (o.isNull("hour") || o.isNull("minute")) {
+                status.setText("Alarm NOT set: no time heard in: " + raw);
+                showLocalReply("वेळ समजली नाही. कितीचा अलार्म लावू ते पुन्हा सांग.");
+                return;
+            }
+            int h = o.optInt("hour", -1), m = o.optInt("minute", -1);
+            if (h < 0 || h > 23 || m < 0 || m > 59) {
+                status.setText("Alarm NOT set: invalid time " + h + ":" + m);
+                showLocalReply("वेळ समजली नाही. पुन्हा सांग.");
+                return;
+            }
+            String label = o.optString("label", "").trim();
+            if (label.equals("null")) {
+                label = "";
+            }
+            pendingAlarmHour = h;
+            pendingAlarmMin = m;
+            pendingAlarmLabel = label;
+            awaitingAlarmConfirm = true;
+            String hhmm = String.format(Locale.US, "%02d:%02d", h, m);
+            status.setText("Confirm alarm at " + hhmm + " - say YES (हो) to set it");
+            showLocalReply("अलार्म " + hhmm + " ला लावू? बरोबर असेल तर हो म्हण.");
+        } catch (Exception e) {
+            status.setText("Error: alarm parse failed (" + e.getMessage() + ") - not set");
+            reply.setText("(alarm not set)");
+            maybeContinueLoop();
+        }
+    }
+
+    private void setSystemAlarm() {
+        try {
+            Intent i = new Intent(android.provider.AlarmClock.ACTION_SET_ALARM)
+                    .putExtra(android.provider.AlarmClock.EXTRA_HOUR, pendingAlarmHour)
+                    .putExtra(android.provider.AlarmClock.EXTRA_MINUTES, pendingAlarmMin)
+                    .putExtra(android.provider.AlarmClock.EXTRA_MESSAGE, pendingAlarmLabel)
+                    .putExtra(android.provider.AlarmClock.EXTRA_SKIP_UI, true);
+            startActivity(i);
+            String hhmm = String.format(Locale.US, "%02d:%02d", pendingAlarmHour, pendingAlarmMin);
+            status.setText("Alarm requested for " + hhmm + " (check your Clock app)");
+            showLocalReply("अलार्म " + hhmm + " ला लावला.");
+        } catch (Exception e) {
+            status.setText("Error: alarm NOT set - " + e.getMessage());
+            showLocalReply("अलार्म सेट झाला नाही.");
         }
     }
 
@@ -906,7 +1029,9 @@ public class MainActivity extends Activity {
                         + " and at for clock times (\"at 6 pm\", \"tomorrow 7 am\"; if a clock"
                         + " time today has already passed, use tomorrow). If no time is given,"
                         + " set both to null.";
-                final String json = callGeminiJson(apiKey, system, raw);
+                String j0 = callGeminiJson(apiKey, system, raw);
+                if (j0 == null) { j0 = callGeminiJson(apiKey, system, raw); }
+                final String json = j0;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
@@ -1071,7 +1196,7 @@ public class MainActivity extends Activity {
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             conn.setRequestProperty("Authorization", "Bearer " + apiKey);
             conn.setConnectTimeout(10000);
-            conn.setReadTimeout(20000);
+            conn.setReadTimeout(30000);
             conn.setDoOutput(true);
             JSONObject sys = new JSONObject().put("parts",
                     new JSONArray().put(new JSONObject().put("text", system)));
