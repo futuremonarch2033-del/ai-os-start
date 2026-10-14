@@ -1,0 +1,12 @@
+import w from "./src/index.js";
+const env = { BRAIN_TOKEN: "t", GEMINI_API_KEY: "k" };
+const call = (path, opts, e = env) => w.fetch(new Request("http://x" + path, opts), e).then(async r => [r.status, await r.json()]);
+const post = (body, tok = "t") => ({ method: "POST", headers: { authorization: "Bearer " + tok }, body: JSON.stringify(body) });
+console.log(await call("/health"));
+console.log(await call("/ask", post({ text: "hi" }, "bad")));
+console.log(await call("/ask", post({})));
+globalThis.fetch = async () => new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "नवी दिल्ली" }] } }] }));
+console.log(await call("/ask", post({ text: "भारताची राजधानी" })));
+globalThis.fetch = async () => new Response('{"error":{"message":"quota exceeded"}}', { status: 429 });
+console.log(await call("/ask", post({ text: "x" })));
+console.log(await call("/ask", post({ text: "x" }), { BRAIN_TOKEN: "t" }));
