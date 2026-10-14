@@ -7,20 +7,30 @@ const SYSTEM = "You are Prem Chavan's personal assistant, made by Prem Chavan. R
 const providers = {
   async gemini({ env, history, text }) {
     if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY secret is not set on the server");
-    const model = env.GEMINI_MODEL || "gemini-3.5-flash";
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    const models = (env.GEMINI_MODEL || "gemini-3.5-flash,gemini-3.8-flash,gemini-flash-latest,gemini-flash-lite-latest").split(",").map((m) => m.trim()).filter(Boolean);
     const contents = [...history, { role: "user", text }].map((h) => ({
       role: h.role === "model" ? "model" : "user",
       parts: [{ text: h.text }],
     }));
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
-      body: JSON.stringify({ system_instruction: { parts: [{ text: SYSTEM }] }, contents }),
-    });
-    const body = await r.text();
-    if (!r.ok) throw new Error(`Gemini HTTP ${r.status}: ${body.slice(0, 300)}`);
-    const j = JSON.parse(body);
+    const errs = [];
+    let j = null;
+    for (const model of models) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+      for (let attempt = 0; attempt < 2 && !j; attempt++) {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+          body: JSON.stringify({ system_instruction: { parts: [{ text: SYSTEM }] }, contents }),
+        });
+        const body = await r.text();
+        if (r.ok) { j = JSON.parse(body); break; }
+        errs.push(`${model} HTTP ${r.status}: ${body.replace(/\s+/g, " ").slice(0, 160)}`);
+        if (r.status !== 503 && r.status !== 429) break;
+        await new Promise((res) => setTimeout(res, 700));
+      }
+      if (j) break;
+    }
+    if (!j) throw new Error("Gemini failed on all models: " + errs.join(" | "));
     const out = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
     if (!out) throw new Error("Gemini returned an empty reply");
     return { text: out };
