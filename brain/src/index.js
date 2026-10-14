@@ -46,6 +46,20 @@ const providers = {
   },
 };
 
+// ---- Storage interface (swap the backend here; tools only use get/set/list/del) ----
+let _kv;
+const store = {
+  async kv() { if (!_kv) _kv = await Deno.openKv(); return _kv; },
+  async get(key) { return (await (await this.kv()).get(key)).value; },
+  async set(key, value, opts) { await (await this.kv()).set(key, value, opts); },
+  async del(key) { await (await this.kv()).delete(key); },
+  async list(prefix, limit = 20) {
+    const out = [];
+    for await (const e of (await this.kv()).list({ prefix }, { limit, reverse: true })) out.push({ key: e.key, value: e.value });
+    return out;
+  },
+};
+
 // ---- Tool interface: each tool {description, parameters, needsConfirm, run(args, env)} ----
 // needsConfirm tools never run from the model's own say-so; see runTool.
 const tools = {
@@ -67,6 +81,28 @@ const tools = {
       };
     },
   },
+  notes_create: {
+    description: "Save a new note for the user. Needs the user's explicit confirmation, which the server asks for itself. Call it when the user asks to save/write down a note.",
+    parameters: { type: "object", properties: { text: { type: "string", description: "The note text" }, title: { type: "string", description: "Optional short title" } }, required: ["text"] },
+    needsConfirm: true,
+    summary: (a) => `नोट सेव्ह करू? "${String(a.text || "").slice(0, 120)}"`,
+    async run(a) {
+      const text = String(a.text || "").trim();
+      if (!text) throw new Error("note text is empty");
+      const id = Date.now().toString();
+      await store.set(["notes", id], { id, title: a.title || "", text, created: new Date().toISOString() });
+      return { saved: true, id };
+    },
+  },
+  notes_list: {
+    description: "List the user's most recent saved notes (newest first). Use to read or search notes.",
+    parameters: { type: "object", properties: { limit: { type: "integer", description: "Max notes, default 10" } } },
+    needsConfirm: false,
+    async run(a) {
+      const items = await store.list(["notes"], Math.min(Number(a.limit) || 10, 30));
+      return { count: items.length, notes: items.map((i) => i.value) };
+    },
+  },
 };
 
 function toolDeclarations() {
@@ -82,8 +118,10 @@ async function runTool(name, args, env) {
     return { error: `unknown tool ${name}` };
   }
   if (t.needsConfirm) {
-    log("tool_call", { tool: name, args, ok: false, error: "needs user confirmation" });
-    return { error: "this tool needs explicit user confirmation and is not available yet" };
+    // Never runs on the model's say-so: park it as a pending action; only the user's next explicit "yes" executes it (see handlePending).
+    await store.set(["pending", "current"], { tool: name, args: args || {}, at: Date.now() }, { expireIn: 120000 });
+    log("tool_call", { tool: name, args, ok: false, pending: true });
+    return { pending_confirmation: true, note: "Ask nothing yourself. Tell the user briefly that you are waiting for their confirmation." };
   }
   try {
     const result = await t.run(args || {}, env);
@@ -96,8 +134,38 @@ async function runTool(name, args, env) {
 }
 
 // Gemini call with the tool loop. Tools are on for the chat request only (not JSON-mode or memory-compress calls).
+const YES = /^\s*(हो|हो\s*ठीक आहे|होय|ठीक आहे|yes|yeah|ok|okay|confirm|हां|हाँ)\s*[.!।]?\s*$/i;
+const NO = /^\s*(नाही|नको|no|cancel|रद्द)\s*[.!।]?\s*$/i;
+const textReply = (t) => ({ candidates: [{ content: { role: "model", parts: [{ text: t }] } }] });
+
+// Deterministic confirmation: acts only on the user's own last message, never on model output.
+async function handlePending(env, body) {
+  const last = body.contents[body.contents.length - 1];
+  const said = (last?.parts || []).map((p) => p.text || "").join("");
+  const isYes = YES.test(said), isNo = NO.test(said);
+  if (!isYes && !isNo) return null;
+  const pend = await store.get(["pending", "current"]);
+  if (!pend) return null;
+  await store.del(["pending", "current"]);
+  const t = tools[pend.tool];
+  if (isNo || !t) { log("tool_call", { tool: pend.tool, args: pend.args, ok: false, cancelled: true }); return textReply("ठीक आहे, रद्द केले."); }
+  const started = Date.now();
+  try {
+    await t.run(pend.args, env);
+    log("tool_call", { tool: pend.tool, args: pend.args, ok: true, confirmed: true, ms: Date.now() - started });
+    return textReply("झाले, नोट सेव्ह केली.");
+  } catch (e) {
+    log("tool_call", { tool: pend.tool, args: pend.args, ok: false, confirmed: true, error: String(e.message).slice(0, 200) });
+    return textReply("नोट सेव्ह करता आली नाही: " + String(e.message));
+  }
+}
+
+function pendingPrompt(name, args) { const t = tools[name]; return textReply((t.summary ? t.summary(args) : `${name} चालवू?`) + " — 'हो' म्हणा."); }
+
 async function generateWithTools(env, body, wantTools) {
   if (!wantTools) return await geminiGenerate(env, body);
+  const done = await handlePending(env, body);
+  if (done) return done;
   const contents = [...body.contents];
   const reqBody = { ...body, contents, tools: toolDeclarations() };
   for (let i = 0; i < 4; i++) {
@@ -109,6 +177,7 @@ async function generateWithTools(env, body, wantTools) {
     const responses = [];
     for (const p of calls) {
       const r = await runTool(p.functionCall.name, p.functionCall.args, env);
+      if (tools[p.functionCall.name]?.needsConfirm && r.pending_confirmation) return pendingPrompt(p.functionCall.name, p.functionCall.args);
       responses.push({ functionResponse: { name: p.functionCall.name, response: { result: r } } });
     }
     contents.push({ role: "user", parts: responses });
