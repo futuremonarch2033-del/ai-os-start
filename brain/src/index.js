@@ -350,6 +350,29 @@ function log(event, data) {
   console.log(JSON.stringify({ t: new Date().toISOString(), event, ...data }));
 }
 
+async function sha256hex(t) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function safeEq(a, b) {
+  const x = new TextEncoder().encode(a), y = new TextEncoder().encode(b);
+  let diff = x.length ^ y.length;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) diff |= (x[i] || 0) ^ (y[i] || 0);
+  return diff === 0;
+}
+// Accepts the legacy shared BRAIN_TOKEN (until retired by deleting that env var) or a paired device token.
+async function authOk(req, env) {
+  const h = req.headers.get("authorization") || "";
+  if (!h.startsWith("Bearer ")) return null;
+  const tok = h.slice(7);
+  if (env.BRAIN_TOKEN && safeEq(tok, env.BRAIN_TOKEN)) return { kind: "legacy" };
+  const id = await sha256hex(tok);
+  const d = await store.get(["device", id]);
+  if (!d) return null;
+  if (Date.now() - (d.last_seen || 0) > 600000) await store.set(["device", id], { ...d, last_seen: Date.now() }).catch(() => {});
+  return { kind: "device", id: id.slice(0, 8) };
+}
+
 async function shortHash(t) {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t));
   return [...new Uint8Array(d)].slice(0, 4).map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -363,12 +386,12 @@ export default {
     // On Deno Deploy the second argument is not our env, so read Deno.env instead.
     if (typeof Deno !== "undefined") {
       const g = (k) => Deno.env.get(k) || undefined;
-      env = { GEMINI_API_KEY: g("GEMINI_API_KEY"), BRAIN_TOKEN: g("BRAIN_TOKEN"), PROVIDER: g("PROVIDER"), GEMINI_MODEL: g("GEMINI_MODEL"), RATE_PER_MIN: g("RATE_PER_MIN"), DAILY_BUDGET: g("DAILY_BUDGET"), MAX_BODY_BYTES: g("MAX_BODY_BYTES"), MODEL_TIMEOUT_MS: g("MODEL_TIMEOUT_MS") };
+      env = { GEMINI_API_KEY: g("GEMINI_API_KEY"), BRAIN_TOKEN: g("BRAIN_TOKEN"), PROVIDER: g("PROVIDER"), PAIR_CODE: g("PAIR_CODE"), GEMINI_MODEL: g("GEMINI_MODEL"), RATE_PER_MIN: g("RATE_PER_MIN"), DAILY_BUDGET: g("DAILY_BUDGET"), MAX_BODY_BYTES: g("MAX_BODY_BYTES"), MODEL_TIMEOUT_MS: g("MODEL_TIMEOUT_MS") };
     }
     env = env || {};
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      return json({ ok: true, provider: env.PROVIDER || "gemini", geminiKeySet: !!env.GEMINI_API_KEY, tokenSet: !!env.BRAIN_TOKEN });
+      return json({ ok: true, provider: env.PROVIDER || "gemini", geminiKeySet: !!env.GEMINI_API_KEY, tokenSet: !!env.BRAIN_TOKEN, pairingOpen: !!env.PAIR_CODE });
     }
     // ---- Abuse limits (interim hardening): per-IP rate limit on everything except /health ----
     const ip = (req.headers.get("x-forwarded-for") || "unknown").split(",")[0].trim();
@@ -378,13 +401,50 @@ export default {
       if (minuteN === perMin + 1) log("alert", { kind: "rate_limit", ip_hash: await shortHash(ip), per_min: perMin });
       return json({ ok: false, error: "rate limit exceeded, slow down" }, 429);
     }
+    // ---- Device pairing: the APK holds no secret. One-time PAIR_CODE (env) -> per-device token (only its hash is stored). ----
+    if (url.pathname === "/pair" && req.method === "POST") {
+      const hourN = await store.incr(["pairtry", ip, Math.floor(Date.now() / 3600000)], 7200000).catch(() => 0);
+      const dayTry = await store.incr(["pairtry-all", new Date().toISOString().slice(0, 10)], 172800000).catch(() => 0);
+      if (hourN > 8 || dayTry > 30) { log("alert", { kind: "pair_rate_limit", ip_hash: await shortHash(ip) }); return json({ ok: false, error: "too many pairing attempts, try later" }, 429); }
+      let pb; try { pb = await req.json(); } catch { return json({ ok: false, error: "body must be JSON" }, 400); }
+      const code = String(pb.code || "");
+      if (!env.PAIR_CODE) return json({ ok: false, error: "pairing is closed (no PAIR_CODE is set on the server)" }, 403);
+      if (!code || !safeEq(code, env.PAIR_CODE)) { log("pair_fail", { reason: "bad_code" }); return json({ ok: false, error: "wrong pairing code" }, 403); }
+      const codeId = await sha256hex("paircode:" + env.PAIR_CODE);
+      if (await store.get(["paircode_used", codeId])) { log("pair_fail", { reason: "code_used" }); return json({ ok: false, error: "this pairing code was already used; set a new PAIR_CODE on the server" }, 403); }
+      const raw = crypto.getRandomValues(new Uint8Array(32));
+      const token = "dv_" + btoa(String.fromCharCode(...raw)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      const id = await sha256hex(token);
+      const name = String(pb.name || "device").slice(0, 40);
+      await store.set(["device", id], { name, created: new Date().toISOString(), last_seen: Date.now() });
+      await store.set(["paircode_used", codeId], true);
+      log("paired", { id: id.slice(0, 8), name });
+      return json({ ok: true, token, id: id.slice(0, 8) });
+    }
+    if (url.pathname === "/devices" && (req.method === "GET" || req.method === "POST")) {
+      if (!(await authOk(req, env))) return json({ ok: false, error: "unauthorized" }, 401);
+      if (req.method === "GET") {
+        const list = await store.list(["device"], 50);
+        return json({ ok: true, devices: list.map((d) => ({ id: d.key[1].slice(0, 8), name: d.value.name, created: d.value.created, last_seen: new Date(d.value.last_seen || 0).toISOString() })) });
+      }
+      let rb; try { rb = await req.json(); } catch { return json({ ok: false, error: "body must be JSON" }, 400); }
+      const want = String(rb.id || "");
+      if (want.length < 6) return json({ ok: false, error: "id (from GET /devices) required" }, 400);
+      const list = await store.list(["device"], 50);
+      const hit = list.filter((d) => d.key[1].startsWith(want));
+      if (hit.length !== 1) return json({ ok: false, error: hit.length ? "id is ambiguous" : "no such device" }, hit.length ? 400 : 404);
+      await store.del(hit[0].key);
+      log("device_revoked", { id: want.slice(0, 8) });
+      return json({ ok: true, revoked: want.slice(0, 8) });
+    }
     if (url.pathname === "/tools" && req.method === "GET") {
-      if (!env.BRAIN_TOKEN || req.headers.get("authorization") !== `Bearer ${env.BRAIN_TOKEN}`) return json({ ok: false, error: "unauthorized" }, 401);
+      if (!(await authOk(req, env))) return json({ ok: false, error: "unauthorized" }, 401);
       return json({ ok: true, tools: Object.entries(tools).map(([name, t]) => ({ name, description: t.description, needsConfirm: t.needsConfirm, parameters: t.parameters })) });
     }
     if (!["/ask", "/generate"].includes(url.pathname) || req.method !== "POST") return json({ ok: false, error: "not found" }, 404);
 
-    if (!env.BRAIN_TOKEN || req.headers.get("authorization") !== `Bearer ${env.BRAIN_TOKEN}`) {
+    const who = await authOk(req, env);
+    if (!who) {
       log("auth_fail", {});
       return json({ ok: false, error: "unauthorized" }, 401);
     }
