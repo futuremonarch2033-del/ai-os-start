@@ -53,6 +53,11 @@ const store = {
   async get(key) { return (await (await this.kv()).get(key)).value; },
   async set(key, value, opts) { await (await this.kv()).set(key, value, opts); },
   async del(key) { await (await this.kv()).delete(key); },
+  async listRange(prefix, start, end, limit = 20) {
+    const out = [];
+    for await (const e of (await this.kv()).list({ start, end }, { limit })) out.push({ key: e.key, value: e.value });
+    return out;
+  },
   async list(prefix, limit = 20) {
     const out = [];
     for await (const e of (await this.kv()).list({ prefix }, { limit, reverse: true })) out.push({ key: e.key, value: e.value });
@@ -60,50 +65,169 @@ const store = {
   },
 };
 
-// ---- Tool interface: each tool {description, parameters, needsConfirm, run(args, env)} ----
-// needsConfirm tools never run from the model's own say-so; see runTool.
-const tools = {
-  get_datetime: {
-    description: "Get the current date, weekday and time. Use whenever the user asks what time, date or day it is, or needs a relative date worked out. Default timezone is Asia/Kolkata (IST).",
-    parameters: { type: "object", properties: { timezone: { type: "string", description: "IANA timezone, e.g. Asia/Kolkata. Optional." } } },
-    needsConfirm: false,
+// ======================= TOOL FRAMEWORK (meta-tool pattern) =======================
+// A tool is defined by a SPEC, never wired by hand:
+//   registerTool({ name, description, parameters (JSON schema), needsConfirm, run(args, env),
+//                  summary?(args)  - confirmation question (needed when needsConfirm),
+//                  doneMsg?        - reply after a confirmed run })
+// registerTool validates the spec, rejects duplicates, and wraps run() with argument validation.
+// defineCollection(spec) is a generator on top: one declarative spec -> <name>_create (confirm)
+// and <name>_list tools backed by the storage interface. New tools = new specs, no new plumbing.
+// GET /tools (authenticated) lists everything registered.
+const tools = {};
+
+function registerTool(spec) {
+  if (!spec || !/^[a-z][a-z0-9_]{2,40}$/.test(spec.name || "")) throw new Error(`bad tool name: ${spec && spec.name}`);
+  if (tools[spec.name]) throw new Error(`duplicate tool: ${spec.name}`);
+  if (typeof spec.description !== "string" || !spec.description) throw new Error(`${spec.name}: description required`);
+  if (!spec.parameters || spec.parameters.type !== "object") throw new Error(`${spec.name}: parameters must be an object schema`);
+  if (typeof spec.needsConfirm !== "boolean") throw new Error(`${spec.name}: needsConfirm must be explicit true/false`);
+  if (typeof spec.run !== "function") throw new Error(`${spec.name}: run must be a function`);
+  if (spec.needsConfirm && typeof spec.summary !== "function") throw new Error(`${spec.name}: confirm tools need summary()`);
+  const inner = spec.run;
+  tools[spec.name] = { ...spec, async run(args, env) {
+    const bad = validateArgs(spec.parameters, args || {});
+    if (bad) throw new Error(bad);
+    return await inner(args || {}, env);
+  } };
+}
+
+function validateArgs(schema, args) {
+  for (const k of schema.required || []) {
+    if (args[k] === undefined || args[k] === null || args[k] === "") return `missing required argument: ${k}`;
+  }
+  for (const [k, def] of Object.entries(schema.properties || {})) {
+    const v = args[k];
+    if (v === undefined || v === null) continue;
+    const ok = def.type === "integer" ? Number.isInteger(v) : def.type === "number" ? typeof v === "number" : def.type === "string" ? typeof v === "string" : def.type === "boolean" ? typeof v === "boolean" : true;
+    if (!ok) return `argument ${k} must be ${def.type}`;
+    if (def.enum && !def.enum.includes(v)) return `argument ${k} must be one of ${def.enum.join(", ")}`;
+  }
+  return null;
+}
+
+// Collection spec: {name, noun, fields:{f:{type,description,required}}, summary(a), doneMsg,
+//   createDescription, listDescription, prepare?(rec)->{key:[...], rec} (validate + key), listQuery?(args)->{start,end}|null, listParams?}
+function defineCollection(c) {
+  const props = {};
+  const required = [];
+  for (const [f, d] of Object.entries(c.fields)) { props[f] = { type: d.type, description: d.description }; if (d.required) required.push(f); }
+  registerTool({
+    name: `${c.name}_create`, description: c.createDescription, needsConfirm: true,
+    parameters: { type: "object", properties: props, required },
+    summary: c.summary, doneMsg: c.doneMsg,
     async run(a) {
-      const tz = a.timezone || "Asia/Kolkata";
-      const now = new Date();
-      const fmt = (o) => new Intl.DateTimeFormat("en-GB", { timeZone: tz, ...o }).format(now);
-      return {
-        timezone: tz,
-        date: fmt({ year: "numeric", month: "long", day: "numeric" }),
-        weekday: fmt({ weekday: "long" }),
-        time_24h: fmt({ hour: "2-digit", minute: "2-digit", hour12: false }),
-        time_12h: new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit", hour12: true }).format(now),
-        iso_utc: now.toISOString(),
-      };
-    },
-  },
-  notes_create: {
-    description: "Save a new note for the user. Needs the user's explicit confirmation, which the server asks for itself. Call it when the user asks to save/write down a note.",
-    parameters: { type: "object", properties: { text: { type: "string", description: "The note text" }, title: { type: "string", description: "Optional short title" } }, required: ["text"] },
-    needsConfirm: true,
-    summary: (a) => `नोट सेव्ह करू? "${String(a.text || "").slice(0, 120)}"`,
-    async run(a) {
-      const text = String(a.text || "").trim();
-      if (!text) throw new Error("note text is empty");
       const id = Date.now().toString();
-      await store.set(["notes", id], { id, title: a.title || "", text, created: new Date().toISOString() });
+      let rec = { id, created: new Date().toISOString() };
+      for (const f of Object.keys(c.fields)) if (a[f] !== undefined) rec[f] = a[f];
+      let key = [c.name, id];
+      if (c.prepare) { const p = c.prepare(rec); rec = p.rec; key = p.key; }
+      await store.set(key, rec);
       return { saved: true, id };
     },
-  },
-  notes_list: {
-    description: "List the user's most recent saved notes (newest first). Use to read or search notes.",
-    parameters: { type: "object", properties: { limit: { type: "integer", description: "Max notes, default 10" } } },
-    needsConfirm: false,
+  });
+  registerTool({
+    name: `${c.name}_list`, description: c.listDescription, needsConfirm: false,
+    parameters: { type: "object", properties: { limit: { type: "integer", description: "Max items, default 10" }, ...(c.listParams || {}) } },
     async run(a) {
-      const items = await store.list(["notes"], Math.min(Number(a.limit) || 10, 30));
-      return { count: items.length, notes: items.map((i) => i.value) };
+      const limit = Math.min(a.limit || 10, 30);
+      const q = c.listQuery ? c.listQuery(a) : null;
+      const items = q ? await store.listRange([c.name], q.start, q.end, limit) : await store.list([c.name], limit);
+      const recs = items.map((i) => (c.present ? c.present(i.value) : i.value));
+      return { count: recs.length, [c.name]: recs };
     },
+  });
+}
+
+// ---- Tool: current date/time ----
+registerTool({
+  name: "get_datetime",
+  description: "Get the current date, weekday and time. Use whenever the user asks what time, date or day it is, or needs a relative date worked out. Default timezone is Asia/Kolkata (IST).",
+  parameters: { type: "object", properties: { timezone: { type: "string", description: "IANA timezone, e.g. Asia/Kolkata. Optional." } } },
+  needsConfirm: false,
+  async run(a) {
+    const tz = a.timezone || "Asia/Kolkata";
+    const now = new Date();
+    const fmt = (o) => new Intl.DateTimeFormat("en-GB", { timeZone: tz, ...o }).format(now);
+    return {
+      timezone: tz,
+      date: fmt({ year: "numeric", month: "long", day: "numeric" }),
+      weekday: fmt({ weekday: "long" }),
+      time_24h: fmt({ hour: "2-digit", minute: "2-digit", hour12: false }),
+      time_12h: new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit", hour12: true }).format(now),
+      iso_utc: now.toISOString(),
+    };
   },
-};
+});
+
+// ---- Collection: notes ----
+defineCollection({
+  name: "notes",
+  fields: { text: { type: "string", description: "The note text", required: true }, title: { type: "string", description: "Optional short title" } },
+  createDescription: "Save a new note for the user. Needs the user's explicit confirmation, which the server asks for itself. Call it when the user asks to save/write down a note.",
+  listDescription: "List the user's most recent saved notes (newest first). Use to read or search notes.",
+  summary: (a) => `नोट सेव्ह करू? "${String(a.text || "").slice(0, 120)}"`,
+  doneMsg: "झाले, नोट सेव्ह केली.",
+});
+
+// ---- Collection: calendar events (times are IST, UTC+05:30, no DST) ----
+const IST = "+05:30";
+const DAY = 86400000;
+const istDate = (ms) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date(ms));
+const istTime = (ms) => new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(ms));
+function dayRange(a) {
+  let d = String(a.date || "today").trim().toLowerCase();
+  const todayStr = istDate(Date.now());
+  let startMs;
+  if (d === "today") startMs = Date.parse(todayStr + "T00:00:00" + IST);
+  else if (d === "tomorrow") startMs = Date.parse(todayStr + "T00:00:00" + IST) + DAY;
+  else if (/^\d{4}-\d{2}-\d{2}$/.test(d)) startMs = Date.parse(d + "T00:00:00" + IST);
+  else throw new Error("date must be today, tomorrow or YYYY-MM-DD");
+  if (Number.isNaN(startMs)) throw new Error("invalid date");
+  const days = Math.min(Math.max(a.days || 1, 1), 31);
+  return { start: startMs, end: startMs + days * DAY };
+}
+defineCollection({
+  name: "events",
+  fields: {
+    title: { type: "string", description: "What the event is", required: true },
+    start: { type: "string", description: "Start date and time in IST as YYYY-MM-DDTHH:MM (24h). Work out relative dates with get_datetime first.", required: true },
+    note: { type: "string", description: "Optional detail or place" },
+  },
+  createDescription: "Add a calendar event/appointment to the user's schedule. Needs the user's explicit confirmation, which the server asks for itself.",
+  listDescription: "List calendar events/schedule for a day or range (IST), oldest first. Use for 'what is my schedule today/tomorrow'.",
+  listParams: { date: { type: "string", description: "today, tomorrow, or YYYY-MM-DD. Default today." }, days: { type: "integer", description: "Number of days from date, default 1" } },
+  listQuery: (a) => { const r = dayRange(a); return { start: ["events", r.start], end: ["events", r.end] }; },
+  prepare: (rec) => {
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(rec.start)) throw new Error("start must be YYYY-MM-DDTHH:MM");
+    const ms = Date.parse(rec.start + ":00" + IST);
+    if (Number.isNaN(ms)) throw new Error("invalid start time");
+    return { rec: { ...rec, startMs: ms }, key: ["events", ms, rec.id] };
+  },
+  present: (r) => ({ title: r.title, date: istDate(r.startMs), time: istTime(r.startMs), note: r.note || "" }),
+  summary: (a) => `इव्हेंट जोडू? "${String(a.title || "").slice(0, 80)}" - ${String(a.start || "")}`,
+  doneMsg: "झाले, इव्हेंट शेड्यूलमध्ये जोडला.",
+});
+
+// ---- Tool: morning briefing (composes other tools; read-only) ----
+registerTool({
+  name: "morning_briefing",
+  description: "Give the user a morning briefing: today's date and weekday, today's schedule, and recent notes, in one go. Use when the user asks for a briefing, 'good morning', or 'what's my day'.",
+  parameters: { type: "object", properties: {} },
+  needsConfirm: false,
+  async run(a, env) {
+    const dt = await tools.get_datetime.run({}, env);
+    const ev = await tools.events_list.run({ date: "today", limit: 20 }, env);
+    const tm = await tools.events_list.run({ date: "tomorrow", limit: 3 }, env);
+    const nt = await tools.notes_list.run({ limit: 5 }, env);
+    return {
+      date: dt.date, weekday: dt.weekday, time_now: dt.time_12h,
+      today_schedule: ev.events, tomorrow_first_items: tm.events,
+      recent_notes: nt.notes.map((n) => n.text),
+      reminders: "Reminders live on the phone and are not visible to the server; do not claim any.",
+    };
+  },
+});
 
 function toolDeclarations() {
   return [{ functionDeclarations: Object.entries(tools).map(([name, t]) => ({ name, description: t.description, parameters: t.parameters })) }];
@@ -153,10 +277,10 @@ async function handlePending(env, body) {
   try {
     await t.run(pend.args, env);
     log("tool_call", { tool: pend.tool, args: pend.args, ok: true, confirmed: true, ms: Date.now() - started });
-    return textReply("झाले, नोट सेव्ह केली.");
+    return textReply(t.doneMsg || "झाले.");
   } catch (e) {
     log("tool_call", { tool: pend.tool, args: pend.args, ok: false, confirmed: true, error: String(e.message).slice(0, 200) });
-    return textReply("नोट सेव्ह करता आली नाही: " + String(e.message));
+    return textReply("हे करता आले नाही: " + String(e.message));
   }
 }
 
@@ -204,6 +328,10 @@ export default {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
       return json({ ok: true, provider: env.PROVIDER || "gemini", geminiKeySet: !!env.GEMINI_API_KEY, tokenSet: !!env.BRAIN_TOKEN });
+    }
+    if (url.pathname === "/tools" && req.method === "GET") {
+      if (!env.BRAIN_TOKEN || req.headers.get("authorization") !== `Bearer ${env.BRAIN_TOKEN}`) return json({ ok: false, error: "unauthorized" }, 401);
+      return json({ ok: true, tools: Object.entries(tools).map(([name, t]) => ({ name, description: t.description, needsConfirm: t.needsConfirm, parameters: t.parameters })) });
     }
     if (!["/ask", "/generate"].includes(url.pathname) || req.method !== "POST") return json({ ok: false, error: "not found" }, 404);
 
