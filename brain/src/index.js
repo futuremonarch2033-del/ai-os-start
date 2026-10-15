@@ -52,6 +52,7 @@ const store = {
   async kv() { if (!_kv) _kv = await Deno.openKv(); return _kv; },
   async get(key) { return (await (await this.kv()).get(key)).value; },
   async set(key, value, opts) { await (await this.kv()).set(key, value, opts); },
+  async incr(key, ttlMs) { const n = ((await this.get(key)) || 0) + 1; await this.set(key, n, { expireIn: ttlMs }); return n; },
   async del(key) { await (await this.kv()).delete(key); },
   async listRange(prefix, start, end, limit = 20) {
     const out = [];
@@ -349,6 +350,11 @@ function log(event, data) {
   console.log(JSON.stringify({ t: new Date().toISOString(), event, ...data }));
 }
 
+async function shortHash(t) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t));
+  return [...new Uint8Array(d)].slice(0, 4).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json; charset=utf-8" } });
 
@@ -357,12 +363,20 @@ export default {
     // On Deno Deploy the second argument is not our env, so read Deno.env instead.
     if (typeof Deno !== "undefined") {
       const g = (k) => Deno.env.get(k) || undefined;
-      env = { GEMINI_API_KEY: g("GEMINI_API_KEY"), BRAIN_TOKEN: g("BRAIN_TOKEN"), PROVIDER: g("PROVIDER"), GEMINI_MODEL: g("GEMINI_MODEL"), MODEL_TIMEOUT_MS: g("MODEL_TIMEOUT_MS") };
+      env = { GEMINI_API_KEY: g("GEMINI_API_KEY"), BRAIN_TOKEN: g("BRAIN_TOKEN"), PROVIDER: g("PROVIDER"), GEMINI_MODEL: g("GEMINI_MODEL"), RATE_PER_MIN: g("RATE_PER_MIN"), DAILY_BUDGET: g("DAILY_BUDGET"), MAX_BODY_BYTES: g("MAX_BODY_BYTES"), MODEL_TIMEOUT_MS: g("MODEL_TIMEOUT_MS") };
     }
     env = env || {};
     const url = new URL(req.url);
     if (url.pathname === "/health") {
       return json({ ok: true, provider: env.PROVIDER || "gemini", geminiKeySet: !!env.GEMINI_API_KEY, tokenSet: !!env.BRAIN_TOKEN });
+    }
+    // ---- Abuse limits (interim hardening): per-IP rate limit on everything except /health ----
+    const ip = (req.headers.get("x-forwarded-for") || "unknown").split(",")[0].trim();
+    const perMin = Number(env.RATE_PER_MIN) || 60;
+    const minuteN = await store.incr(["rl", ip, Math.floor(Date.now() / 60000)], 120000).catch(() => 0);
+    if (minuteN > perMin) {
+      if (minuteN === perMin + 1) log("alert", { kind: "rate_limit", ip_hash: await shortHash(ip), per_min: perMin });
+      return json({ ok: false, error: "rate limit exceeded, slow down" }, 429);
     }
     if (url.pathname === "/tools" && req.method === "GET") {
       if (!env.BRAIN_TOKEN || req.headers.get("authorization") !== `Bearer ${env.BRAIN_TOKEN}`) return json({ ok: false, error: "unauthorized" }, 401);
@@ -373,6 +387,16 @@ export default {
     if (!env.BRAIN_TOKEN || req.headers.get("authorization") !== `Bearer ${env.BRAIN_TOKEN}`) {
       log("auth_fail", {});
       return json({ ok: false, error: "unauthorized" }, 401);
+    }
+    const maxBody = Number(env.MAX_BODY_BYTES) || 200000;
+    const declared = Number(req.headers.get("content-length") || 0);
+    if (declared > maxBody) { log("alert", { kind: "body_too_large", bytes: declared }); return json({ ok: false, error: `request body too large (limit ${maxBody} bytes)` }, 413); }
+    // Global daily request budget (authenticated requests only), resets each UTC day.
+    const dailyCap = Number(env.DAILY_BUDGET) || 1000;
+    const dayN = await store.incr(["budget", new Date().toISOString().slice(0, 10)], 172800000).catch(() => 0);
+    if (dayN > dailyCap) {
+      if (dayN === dailyCap + 1) log("alert", { kind: "daily_budget_exceeded", cap: dailyCap });
+      return json({ ok: false, error: `daily request budget (${dailyCap}) reached; resets at 00:00 UTC (05:30 IST)` }, 429);
     }
     let body;
     try { body = await req.json(); } catch { return json({ ok: false, error: "body must be JSON" }, 400); }
