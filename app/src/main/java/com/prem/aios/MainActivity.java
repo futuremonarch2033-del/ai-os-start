@@ -96,6 +96,90 @@ public class MainActivity extends Activity {
     private boolean awaitingSettingsReturn = false;
     private long settingsLaunchedAt = 0L;
     private boolean awaitingForgetConfirm = false;
+    private android.widget.EditText pairInput;
+    private Button pairBtn;
+    private LinearLayout pairBox;
+
+    // Device token comes from private app storage after pairing; the build-time token is only a legacy fallback.
+    private String authToken() {
+        String t = getSharedPreferences("aios_prefs", MODE_PRIVATE).getString("device_token", "");
+        if (t != null && !t.isEmpty()) {
+            return t;
+        }
+        return BuildConfig.BRAIN_TOKEN;
+    }
+
+    private boolean isPaired() {
+        String t = getSharedPreferences("aios_prefs", MODE_PRIVATE).getString("device_token", "");
+        return t != null && !t.isEmpty();
+    }
+
+    private void doPair() {
+        final String code = pairInput.getText().toString().trim();
+        if (code.isEmpty()) {
+            status.setText("Type the pairing code first");
+            return;
+        }
+        status.setText("Pairing...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String msg;
+                boolean ok = false;
+                HttpURLConnection conn = null;
+                try {
+                    conn = (HttpURLConnection) new URL(GEMINI_URL.replace("/generate", "/pair")).openConnection();
+                    conn.setRequestMethod("POST");
+                    conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+                    conn.setConnectTimeout(15000);
+                    conn.setReadTimeout(20000);
+                    conn.setDoOutput(true);
+                    JSONObject body = new JSONObject().put("code", code)
+                            .put("name", android.os.Build.MODEL);
+                    OutputStream os = conn.getOutputStream();
+                    os.write(body.toString().getBytes("UTF-8"));
+                    os.close();
+                    int rc = conn.getResponseCode();
+                    InputStream is = (rc >= 200 && rc < 300) ? conn.getInputStream() : conn.getErrorStream();
+                    JSONObject o = new JSONObject(readAll(is));
+                    if (rc >= 200 && rc < 300 && o.optBoolean("ok", false)) {
+                        getSharedPreferences("aios_prefs", MODE_PRIVATE).edit()
+                                .putString("device_token", o.getString("token")).apply();
+                        ok = true;
+                        msg = "Paired OK (device " + o.optString("id") + ")";
+                    } else {
+                        msg = "Pairing failed: " + o.optString("error", "HTTP " + rc);
+                    }
+                } catch (Exception e) {
+                    msg = "Pairing failed: " + e.getMessage();
+                } finally {
+                    if (conn != null) {
+                        conn.disconnect();
+                    }
+                }
+                final String fmsg = msg;
+                final boolean fok = ok;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        status.setText(fmsg);
+                        if (fok) {
+                            pairInput.setText("");
+                            pairBox.setVisibility(View.GONE);
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void onAuthRejected() {
+        if (isPaired()) {
+            getSharedPreferences("aios_prefs", MODE_PRIVATE).edit().remove("device_token").apply();
+            pairBox.setVisibility(View.VISIBLE);
+            status.setText("This device was rejected (revoked?). Enter a new pairing code and tap PAIR");
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -161,6 +245,26 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.setMargins(24, 14, 24, 14);
         layout.addView(status, lp);
+        pairBox = new LinearLayout(this);
+        pairBox.setOrientation(LinearLayout.VERTICAL);
+        TextView pairLabel = new TextView(this);
+        pairLabel.setText("Pair this device (one-time code)");
+        pairInput = new android.widget.EditText(this);
+        pairInput.setHint("pairing code");
+        pairInput.setSingleLine(true);
+        pairBtn = new Button(this);
+        pairBtn.setText("PAIR");
+        pairBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                doPair();
+            }
+        });
+        pairBox.addView(pairLabel);
+        pairBox.addView(pairInput);
+        pairBox.addView(pairBtn);
+        pairBox.setVisibility(isPaired() ? View.GONE : View.VISIBLE);
+        layout.addView(pairBox, lp);
         layout.addView(torchStatus, lp);
         layout.addView(memoryStatus, lp);
         layout.addView(reminderStatus, lp);
@@ -565,9 +669,9 @@ public class MainActivity extends Activity {
     // ---- Step 3: send transcript to Gemini brain, show reply ----
 
     private void askGemini(final String userText) {
-        final String apiKey = BuildConfig.BRAIN_TOKEN;
+        final String apiKey = authToken();
         if (apiKey == null || apiKey.isEmpty()) {
-            status.setText("No BRAIN_TOKEN in this build - add GitHub secret and rebuild");
+            status.setText("Not paired - enter the pairing code in the box and tap PAIR");
             return;
         }
         status.setText("Thinking...");
@@ -663,6 +767,14 @@ public class MainActivity extends Activity {
                     ? conn.getInputStream() : conn.getErrorStream();
             String resp = readAll(is);
             if (code < 200 || code >= 300) {
+                if (code == 401) {
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            onAuthRejected();
+                        }
+                    });
+                }
                 return "Error: Gemini HTTP " + code + " - " + snippet(resp);
             }
             JSONObject root = new JSONObject(resp);
@@ -779,7 +891,7 @@ public class MainActivity extends Activity {
     }
 
     private void saveFactAsync(final String raw) {
-        final String apiKey = BuildConfig.BRAIN_TOKEN;
+        final String apiKey = authToken();
         if (apiKey == null || apiKey.isEmpty()) {
             finishSave(raw, "no API key, saved as spoken");
             return;
@@ -890,9 +1002,9 @@ public class MainActivity extends Activity {
     }
 
     private void parseAlarmAsync(final String raw) {
-        final String apiKey = BuildConfig.BRAIN_TOKEN;
+        final String apiKey = authToken();
         if (apiKey == null || apiKey.isEmpty()) {
-            status.setText("No BRAIN_TOKEN in this build - cannot set alarm");
+            status.setText("Not paired - enter the pairing code and tap PAIR");
             return;
         }
         status.setText("Understanding alarm...");
@@ -1023,9 +1135,9 @@ public class MainActivity extends Activity {
     }
 
     private void parseReminderAsync(final String raw) {
-        final String apiKey = BuildConfig.BRAIN_TOKEN;
+        final String apiKey = authToken();
         if (apiKey == null || apiKey.isEmpty()) {
-            status.setText("No API key in this build - cannot parse reminder");
+            status.setText("Not paired - enter the pairing code and tap PAIR");
             return;
         }
         status.setText("Understanding reminder...");
@@ -1472,4 +1584,4 @@ public class MainActivity extends Activity {
             tts = null;
         }
     }
-}
+                }
