@@ -127,6 +127,30 @@ function defineCollection(c) {
     },
   });
   registerTool({
+    name: `${c.name}_delete`,
+    description: `Delete one saved ${c.name} item, found by words from its title/text. Needs the user's explicit confirmation, which the server asks for itself. If several match, the tool errors with the candidates: ask the user which one.`,
+    needsConfirm: true,
+    parameters: { type: "object", properties: { match: { type: "string", description: "Words from the item's title or text" }, ...(c.listQuery ? { date: { type: "string", description: "Optional: today, tomorrow or YYYY-MM-DD to narrow the search" } } : {}) }, required: ["match"] },
+    summary: (a) => `${a.label || a.match} काढून टाकू?`,
+    doneMsg: "झाले, काढून टाकले.",
+    // Runs BEFORE the confirm prompt: resolves exactly one target so the user confirms the real item.
+    async resolve(a) {
+      const q = c.listQuery && a.date ? c.listQuery(a) : null;
+      const items = q ? await store.listRange([c.name], q.start, q.end, 200) : await store.list([c.name], 200);
+      const w = String(a.match).toLowerCase();
+      const hits = items.filter((i) => `${i.value.title || ""} ${i.value.text || ""}`.toLowerCase().includes(w));
+      const lab = (i) => { const v = c.present ? c.present(i.value) : i.value; return `"${String(v.title || v.text || "").slice(0, 60)}"${v.date ? " " + v.date + " " + v.time : ""}`; };
+      if (hits.length === 0) throw new Error(`no ${c.name} item matches "${a.match}"`);
+      if (hits.length > 1) throw new Error(`${hits.length} items match: ${hits.slice(0, 5).map(lab).join("; ")}. Ask the user which one (use more specific words${c.listQuery ? " or a date" : ""}).`);
+      return { match: a.match, key: hits[0].key, label: lab(hits[0]) };
+    },
+    async run(a) {
+      if (!a.key) throw new Error("no resolved target");
+      await store.del(a.key);
+      return { deleted: true, item: a.label };
+    },
+  });
+  registerTool({
     name: `${c.name}_list`, description: c.listDescription, needsConfirm: false,
     parameters: { type: "object", properties: { limit: { type: "integer", description: "Max items, default 10" }, ...(c.listParams || {}) } },
     async run(a) {
@@ -243,9 +267,20 @@ async function runTool(name, args, env) {
   }
   if (t.needsConfirm) {
     // Never runs on the model's say-so: park it as a pending action; only the user's next explicit "yes" executes it (see handlePending).
-    await store.set(["pending", "current"], { tool: name, args: args || {}, at: Date.now() }, { expireIn: 120000 });
-    log("tool_call", { tool: name, args, ok: false, pending: true });
-    return { pending_confirmation: true, note: "Ask nothing yourself. Tell the user briefly that you are waiting for their confirmation." };
+    let pargs = args || {};
+    if (t.resolve) {
+      try {
+        const bad = validateArgs(t.parameters, pargs);
+        if (bad) throw new Error(bad);
+        pargs = await t.resolve(pargs);
+      } catch (e) {
+        log("tool_call", { tool: name, args, ok: false, error: String(e.message).slice(0, 300) });
+        return { error: String(e.message) };
+      }
+    }
+    await store.set(["pending", "current"], { tool: name, args: pargs, at: Date.now() }, { expireIn: 120000 });
+    log("tool_call", { tool: name, args: pargs, ok: false, pending: true });
+    return { pending_confirmation: true, pending_args: pargs, note: "Ask nothing yourself. Tell the user briefly that you are waiting for their confirmation." };
   }
   try {
     const result = await t.run(args || {}, env);
@@ -301,7 +336,7 @@ async function generateWithTools(env, body, wantTools) {
     const responses = [];
     for (const p of calls) {
       const r = await runTool(p.functionCall.name, p.functionCall.args, env);
-      if (tools[p.functionCall.name]?.needsConfirm && r.pending_confirmation) return pendingPrompt(p.functionCall.name, p.functionCall.args);
+      if (tools[p.functionCall.name]?.needsConfirm && r.pending_confirmation) return pendingPrompt(p.functionCall.name, r.pending_args || p.functionCall.args);
       responses.push({ functionResponse: { name: p.functionCall.name, response: { result: r } } });
     }
     contents.push({ role: "user", parts: responses });
