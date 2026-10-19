@@ -17,7 +17,20 @@ import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.Gravity;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.ScrollView;
 import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
@@ -189,7 +202,7 @@ public class MainActivity extends Activity {
         status = new TextView(this);
         status.setTextSize(20f);
         status.setGravity(Gravity.CENTER);
-        status.setText("LISTEN = speak Marathi, AI replies below");
+        status.setText("");
 
         memory = new Memory(this);
         memoryStatus = new TextView(this);
@@ -217,12 +230,12 @@ public class MainActivity extends Activity {
         transcript = new TextView(this);
         transcript.setTextSize(22f);
         transcript.setGravity(Gravity.CENTER);
-        transcript.setText("(your Marathi transcript)");
+        transcript.setText("");
 
         reply = new TextView(this);
         reply.setTextSize(22f);
         reply.setGravity(Gravity.CENTER);
-        reply.setText("(AI reply in Marathi)");
+        reply.setText("");
 
         listenBtn = new Button(this);
         listenBtn.setText("LISTEN");
@@ -237,48 +250,7 @@ public class MainActivity extends Activity {
         replayBtn = new Button(this);
         replayBtn.setText("REPLAY VOICE");
 
-        LinearLayout layout = new LinearLayout(this);
-        layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.setMargins(24, 14, 24, 14);
-        layout.addView(status, lp);
-        pairBox = new LinearLayout(this);
-        pairBox.setOrientation(LinearLayout.VERTICAL);
-        TextView pairLabel = new TextView(this);
-        pairLabel.setText("Pair this device (one-time code)");
-        pairInput = new android.widget.EditText(this);
-        pairInput.setHint("pairing code");
-        pairInput.setSingleLine(true);
-        pairBtn = new Button(this);
-        pairBtn.setText("PAIR");
-        pairBtn.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                doPair();
-            }
-        });
-        pairBox.addView(pairLabel);
-        pairBox.addView(pairInput);
-        pairBox.addView(pairBtn);
-        pairBox.setVisibility(isPaired() ? View.GONE : View.VISIBLE);
-        layout.addView(pairBox, lp);
-        layout.addView(torchStatus, lp);
-        layout.addView(memoryStatus, lp);
-        layout.addView(reminderStatus, lp);
-        layout.addView(listenBtn, lp);
-        layout.addView(transcript, lp);
-        layout.addView(reply, lp);
-        layout.addView(replayBtn, lp);
-        layout.addView(recordBtn, lp);
-        layout.addView(playBtn, lp);
-        layout.addView(viewMemoryBtn, lp);
-        layout.addView(forgetBtn, lp);
-        layout.addView(clearChatBtn, lp);
-        layout.addView(viewRemindersBtn, lp);
-        setContentView(layout);
+        buildUi();
 
         // ---- Step 7: flashlight (torch) setup ----
         cameraManager = (CameraManager) getSystemService(CAMERA_SERVICE);
@@ -461,6 +433,329 @@ public class MainActivity extends Activity {
         });
     }
 
+    // ---- V2 arc-reactor interface ----
+    private OrbView orb;
+    private LinearLayout confirmRow;
+    private EditText inputEdit;
+    private TextView micView;
+    private TextView subtitleView;
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+
+    private int dp(float v) {
+        return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private GradientDrawable shape(int fill, int stroke, float radiusDp, float strokeDp) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(fill);
+        g.setCornerRadius(dp(radiusDp));
+        if (stroke != 0) {
+            g.setStroke(Math.max(1, dp(strokeDp)), stroke);
+        }
+        return g;
+    }
+
+    private void routeText(String text) {
+        transcript.setText(text);
+        if (!handleReminderCommand(text) && !handleAlarmCommand(text) && !handleMemoryCommand(text)
+                && !handleLocalCommand(text)) {
+            askGemini(text);
+        }
+    }
+
+    private void sendTyped() {
+        String t = inputEdit.getText().toString().trim();
+        if (t.isEmpty()) {
+            return;
+        }
+        inputEdit.setText("");
+        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null) {
+            imm.hideSoftInputFromWindow(inputEdit.getWindowToken(), 0);
+        }
+        if (!isPaired() && authToken().isEmpty()) {
+            status.setText("Not paired - enter the pairing code and tap PAIR");
+            return;
+        }
+        routeText(t);
+    }
+
+    private boolean awaitingAnyConfirm() {
+        return awaitingReminderConfirm || awaitingAlarmConfirm || awaitingForgetConfirm;
+    }
+
+    private TextView chip(String label, int textColor, int stroke) {
+        TextView c = new TextView(this);
+        c.setText(label);
+        c.setTextColor(textColor);
+        c.setTextSize(17f);
+        c.setTypeface(Typeface.DEFAULT_BOLD);
+        c.setGravity(Gravity.CENTER);
+        c.setBackground(shape(0xFF061A2B, stroke, 22, 1.5f));
+        c.setPadding(dp(30), dp(10), dp(30), dp(10));
+        return c;
+    }
+
+    private void buildUi() {
+        final int CY = 0xFF13D8FF;
+        getWindow().setStatusBarColor(0xFF030A14);
+        getWindow().setNavigationBarColor(0xFF030A14);
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(0xFF030A14);
+        root.setPadding(dp(14), dp(10), dp(14), dp(12));
+
+        // header: title + subtitle centered, menu dots right
+        FrameLayout header = new FrameLayout(this);
+        LinearLayout titleBox = new LinearLayout(this);
+        titleBox.setOrientation(LinearLayout.VERTICAL);
+        titleBox.setGravity(Gravity.CENTER);
+        TextView title = new TextView(this);
+        title.setText("A I   O S");
+        title.setTextColor(CY);
+        title.setTextSize(22f);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setLetterSpacing(0.25f);
+        title.setGravity(Gravity.CENTER);
+        subtitleView = new TextView(this);
+        subtitleView.setTextColor(0xFF6E8FA0);
+        subtitleView.setTextSize(13f);
+        subtitleView.setGravity(Gravity.CENTER);
+        titleBox.addView(title);
+        titleBox.addView(subtitleView);
+        header.addView(titleBox, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView dots = new TextView(this);
+        dots.setText("\u22EE");
+        dots.setTextColor(CY);
+        dots.setTextSize(28f);
+        dots.setTypeface(Typeface.DEFAULT_BOLD);
+        dots.setGravity(Gravity.CENTER);
+        dots.setPadding(dp(12), 0, dp(12), 0);
+        FrameLayout.LayoutParams dlp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.END | Gravity.CENTER_VERTICAL);
+        header.addView(dots, dlp);
+        dots.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showMenu();
+            }
+        });
+        root.addView(header, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // orb: fixed share of the screen so chat keeps room
+        orb = new OrbView(this);
+        int orbSize = Math.min(getResources().getDisplayMetrics().widthPixels - dp(40),
+                (int) (getResources().getDisplayMetrics().heightPixels * 0.36f));
+        LinearLayout.LayoutParams olp = new LinearLayout.LayoutParams(orbSize, orbSize);
+        olp.gravity = Gravity.CENTER_HORIZONTAL;
+        olp.topMargin = dp(8);
+        root.addView(orb, olp);
+
+        // status line under the orb
+        status.setTextColor(CY);
+        status.setTextSize(18f);
+        status.setTypeface(Typeface.DEFAULT_BOLD);
+        status.setGravity(Gravity.CENTER);
+        status.setPadding(dp(8), 0, dp(8), dp(6));
+        root.addView(status, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // pairing box (only when not paired)
+        pairBox = new LinearLayout(this);
+        pairBox.setOrientation(LinearLayout.VERTICAL);
+        pairBox.setPadding(dp(14), dp(8), dp(14), dp(8));
+        pairBox.setBackground(shape(0xFF061A2B, 0xFF0B5E78, 14, 1f));
+        TextView pairLabel = new TextView(this);
+        pairLabel.setText("Pair this device (one-time code)");
+        pairLabel.setTextColor(0xFFB6E8F5);
+        pairInput = new EditText(this);
+        pairInput.setHint("pairing code");
+        pairInput.setHintTextColor(0xFF4F7183);
+        pairInput.setTextColor(Color.WHITE);
+        pairInput.setSingleLine(true);
+        pairBtn = new Button(this);
+        pairBtn.setText("PAIR");
+        pairBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                doPair();
+            }
+        });
+        pairBox.addView(pairLabel);
+        pairBox.addView(pairInput);
+        pairBox.addView(pairBtn);
+        pairBox.setVisibility(isPaired() ? View.GONE : View.VISIBLE);
+        root.addView(pairBox, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // chat area
+        LinearLayout chat = new LinearLayout(this);
+        chat.setOrientation(LinearLayout.VERTICAL);
+        chat.setPadding(dp(4), dp(6), dp(4), dp(6));
+
+        transcript.setTextColor(0xFF03121C);
+        transcript.setTextSize(17f);
+        transcript.setGravity(Gravity.START);
+        transcript.setBackground(shape(0xFF00BFF2, 0, 20, 0));
+        transcript.setPadding(dp(16), dp(10), dp(16), dp(10));
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tlp.gravity = Gravity.END;
+        tlp.topMargin = dp(8);
+        tlp.leftMargin = dp(60);
+        chat.addView(transcript, tlp);
+
+        reply.setTextColor(0xFFEAF6FB);
+        reply.setTextSize(17f);
+        reply.setGravity(Gravity.START);
+        reply.setBackground(shape(0xFF061A2B, 0xFF0B7FA0, 20, 1f));
+        reply.setPadding(dp(16), dp(10), dp(16), dp(10));
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rlp.gravity = Gravity.START;
+        rlp.topMargin = dp(10);
+        rlp.rightMargin = dp(40);
+        chat.addView(reply, rlp);
+
+        confirmRow = new LinearLayout(this);
+        confirmRow.setOrientation(LinearLayout.HORIZONTAL);
+        TextView yes = chip("हो", CY, CY);
+        TextView no = chip("नाही", 0xFF9FB4C0, 0xFF5E7686);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        clp.rightMargin = dp(12);
+        confirmRow.addView(yes, clp);
+        confirmRow.addView(no);
+        LinearLayout.LayoutParams cr = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cr.topMargin = dp(10);
+        chat.addView(confirmRow, cr);
+        yes.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (awaitingAnyConfirm()) {
+                    routeText("हो");
+                }
+            }
+        });
+        no.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (awaitingAnyConfirm()) {
+                    routeText("नाही");
+                }
+            }
+        });
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(chat);
+        root.addView(sv, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // input bar
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setBackground(shape(0xFF061220, 0xFF0B7FA0, 30, 1.5f));
+        bar.setPadding(dp(18), dp(6), dp(8), dp(6));
+        inputEdit = new EditText(this);
+        inputEdit.setHint("इथे लिहा...");
+        inputEdit.setHintTextColor(0xFF4F7183);
+        inputEdit.setTextColor(Color.WHITE);
+        inputEdit.setBackground(null);
+        inputEdit.setMaxLines(3);
+        bar.addView(inputEdit, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        micView = new TextView(this);
+        micView.setText("\uD83C\uDF99");
+        micView.setTextSize(22f);
+        micView.setTextColor(CY);
+        micView.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(dp(52), dp(52));
+        mlp.rightMargin = dp(8);
+        bar.addView(micView, mlp);
+        micView.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                listenBtn.performClick();
+            }
+        });
+
+        TextView send = new TextView(this);
+        send.setText("\u27A4");
+        send.setTextSize(24f);
+        send.setTextColor(0xFF03121C);
+        send.setGravity(Gravity.CENTER);
+        send.setBackground(shape(CY, 0, 26, 0));
+        bar.addView(send, new LinearLayout.LayoutParams(dp(52), dp(52)));
+        send.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                sendTyped();
+            }
+        });
+        inputEdit.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+            @Override
+            public boolean onEditorAction(TextView v, int actionId, android.view.KeyEvent e) {
+                sendTyped();
+                return true;
+            }
+        });
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(8);
+        root.addView(bar, blp);
+
+        setContentView(root);
+
+        // keep orb, bubbles, confirm chips and mic state in sync with app state
+        uiHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                boolean sp = false;
+                try {
+                    sp = tts != null && ttsReady && tts.isSpeaking();
+                } catch (Exception ignored) {
+                }
+                orb.setSpeaking(sp);
+                transcript.setVisibility(transcript.getText().length() == 0 ? View.GONE : View.VISIBLE);
+                reply.setVisibility(reply.getText().length() == 0 ? View.GONE : View.VISIBLE);
+                confirmRow.setVisibility(awaitingAnyConfirm() ? View.VISIBLE : View.GONE);
+                boolean on = listening || loopActive;
+                micView.setBackground(on ? shape(0xFF13D8FF, 0, 26, 0)
+                        : shape(0x00000000, 0xFF13D8FF, 26, 1.5f));
+                micView.setTextColor(on ? 0xFF03121C : 0xFF13D8FF);
+                subtitleView.setText(isPaired() ? "ऑनलाइन \u2022 सुरक्षित" : "पेअर केलेले नाही");
+                pairBox.setVisibility(isPaired() ? View.GONE : View.VISIBLE);
+                uiHandler.postDelayed(this, 120);
+            }
+        });
+    }
+
+    private void showMenu() {
+        final String[] names = {"आवाज पुन्हा ऐका (REPLAY VOICE)", "रेकॉर्ड (RECORD)", "प्ले (PLAY)",
+                "मेमरी पहा (VIEW MEMORY)", "रिमाइंडर पहा (VIEW REMINDERS)",
+                "संभाषण पुसा (CLEAR CONVERSATION)", "सर्व विसर (FORGET EVERYTHING)"};
+        new AlertDialog.Builder(this)
+                .setItems(names, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        Button[] bs = {replayBtn, recordBtn, playBtn, viewMemoryBtn,
+                                viewRemindersBtn, clearChatBtn, forgetBtn};
+                        if (bs[which].isEnabled()) {
+                            bs[which].performClick();
+                        }
+                    }
+                })
+                .setNegativeButton("CLOSE", null)
+                .show();
+    }
+
     private void ensureMicPermission(String action) {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 == PackageManager.PERMISSION_GRANTED) {
@@ -534,13 +829,13 @@ public class MainActivity extends Activity {
         recognizer.setRecognitionListener(new RecognitionListener() {
             @Override
             public void onReadyForSpeech(Bundle params) {
-                status.setText("Listening... speak Marathi");
+                status.setText("ऐकतोय...");
             }
 
             @Override
             public void onBeginningOfSpeech() {
                 consecutiveListenErrors = 0;
-                status.setText("Hearing you...");
+                status.setText("ऐकतोय...");
             }
 
             @Override
@@ -551,7 +846,7 @@ public class MainActivity extends Activity {
 
             @Override
             public void onEndOfSpeech() {
-                status.setText("Processing...");
+                status.setText("विचार करतोय...");
             }
 
             @Override
@@ -596,11 +891,7 @@ public class MainActivity extends Activity {
                 if (text == null || text.isEmpty()) {
                     status.setText("Error: empty result");
                 } else {
-                    transcript.setText(text);
-                    if (!handleReminderCommand(text) && !handleAlarmCommand(text) && !handleMemoryCommand(text)
-                            && !handleLocalCommand(text)) {
-                        askGemini(text);
-                    }
+                    routeText(text);
                 }
             }
 
@@ -674,7 +965,7 @@ public class MainActivity extends Activity {
             status.setText("Not paired - enter the pairing code in the box and tap PAIR");
             return;
         }
-        status.setText("Thinking...");
+        status.setText("विचार करतोय...");
         reply.setText("...");
         new Thread(new Runnable() {
             @Override
@@ -853,7 +1144,7 @@ public class MainActivity extends Activity {
         }
         tts.stop();
         tts.speak(lastReply, TextToSpeech.QUEUE_FLUSH, null, "reply-utterance");
-        status.setText("Speaking reply... (REPLAY VOICE to hear again)");
+        status.setText("बोलतोय...");
     }
 
     // ---- Memory: on-device command layer ----
@@ -1584,4 +1875,4 @@ public class MainActivity extends Activity {
             tts = null;
         }
     }
-                }
+    }
